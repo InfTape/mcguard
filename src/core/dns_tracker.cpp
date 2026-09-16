@@ -285,7 +285,7 @@ std::string DnsTracker::FormatTarget(const std::string& ip, uint16_t port) {
 }
 
 void DnsTracker::PreResolveCommonEndpoints() {
-    const std::vector<std::string> endpoints = {
+    std::vector<std::string> endpoints = {
         "api.minecraftservices.com",
         "sessionserver.mojang.com",
         "authserver.mojang.com",
@@ -297,6 +297,19 @@ void DnsTracker::PreResolveCommonEndpoints() {
         "piston-meta.mojang.com",
         "launcher.mojang.com"
     };
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& suffix : m_allowedSuffixes) {
+            bool exists = false;
+            for (const auto& ep : endpoints) {
+                if (ep == suffix) { exists = true; break; }
+            }
+            if (!exists) {
+                endpoints.push_back(suffix);
+            }
+        }
+    }
 
     std::thread([this, endpoints]() {
         struct addrinfo hints = { 0 };

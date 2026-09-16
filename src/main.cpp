@@ -57,6 +57,13 @@ void PrintUsage() {
 int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
+    // Initialize Winsock
+    WSADATA wsaData;
+    int wsaRes = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (wsaRes != 0) {
+        std::cerr << "[-] WSAStartup failed: " << wsaRes << "\n";
+    }
+
     std::string command = "watch";
     std::vector<core::WhitelistRule> whitelist;
 
@@ -273,6 +280,12 @@ int main(int argc, char* argv[]) {
         view.DisplayRecord(rec);
     });
 
+    for (const auto& r : whitelist) {
+        std::string info = "Rule: " + r.ip + ":" + std::to_string(r.port) + " [" + r.protocol + "]";
+        if (!r.description.empty()) info += " (" + r.description + ")";
+        view.PrintStatus("Loaded " + info);
+    }
+
     // Configure DnsTracker with domain suffixes and dynamic WFP whitelisting callback
     auto& dnsTracker = core::DnsTracker::Instance();
     if (hasConfig && !cfg.allowedDomainSuffixes.empty()) {
@@ -433,5 +446,6 @@ int main(int argc, char* argv[]) {
     wfp.Shutdown();
 
     view.PrintSuccess("MCGuard terminated cleanly. Audit logs saved.");
+    WSACleanup();
     return 0;
 }

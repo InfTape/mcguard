@@ -17,6 +17,10 @@ std::string ConfigLoader::ResolveHostToIp(const std::string& hostOrIp) {
         return hostOrIp;
     }
 
+    // Ensure Winsock initialized
+    WSADATA wsaData;
+    bool wsaInit = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
+
     // Resolve domain name via DNS
     struct addrinfo hints = { 0 };
     hints.ai_family = AF_INET; // IPv4
@@ -30,10 +34,12 @@ std::string ConfigLoader::ResolveHostToIp(const std::string& hostOrIp) {
         if (inet_ntop(AF_INET, &(sockaddr_ipv4->sin_addr), ipBuffer, sizeof(ipBuffer))) {
             std::string resolvedIp(ipBuffer);
             freeaddrinfo(pRes);
+            if (wsaInit) WSACleanup();
             return resolvedIp;
         }
         freeaddrinfo(pRes);
     }
+    if (wsaInit) WSACleanup();
     return hostOrIp;
 }
 
@@ -115,6 +121,29 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         outConfig.allowLocalhost = (allowLocalStr == "true");
     }
 
+    // Parse allowed_domain_suffixes first
+    size_t dsPos = configContent.find("\"allowed_domain_suffixes\"");
+    if (dsPos == std::string::npos) {
+        dsPos = configContent.find("\"domain_suffixes\"");
+    }
+    if (dsPos != std::string::npos) {
+        size_t arrStart = configContent.find('[', dsPos);
+        size_t arrEnd = configContent.find(']', arrStart);
+        if (arrStart != std::string::npos && arrEnd != std::string::npos) {
+            std::string arrStr = configContent.substr(arrStart, arrEnd - arrStart + 1);
+            size_t strPos = 0;
+            while ((strPos = arrStr.find('\"', strPos)) != std::string::npos) {
+                size_t end = arrStr.find('\"', strPos + 1);
+                if (end == std::string::npos) break;
+                std::string suffix = arrStr.substr(strPos + 1, end - strPos - 1);
+                if (!suffix.empty()) {
+                    outConfig.allowedDomainSuffixes.push_back(suffix);
+                }
+                strPos = end + 1;
+            }
+        }
+    }
+
     // Parse whitelist array
     size_t wlPos = configContent.find("\"whitelist\"");
     if (wlPos != std::string::npos) {
@@ -144,17 +173,44 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
                     rule.port = 25565;
                 }
 
-                // If host specified, resolve it; or if ip is a domain, resolve it
-                std::string targetHost = !hostVal.empty() ? hostVal : ipVal;
-                if (!targetHost.empty()) {
-                    std::string resolved = ResolveHostToIp(targetHost);
-                    rule.ip = resolved;
+                // If ipVal is a valid IPv4 address, use it directly!
+                IN_ADDR inAddr;
+                bool ipValValid = !ipVal.empty() && (inet_pton(AF_INET, ipVal.c_str(), &inAddr) == 1);
+
+                if (ipValValid) {
+                    rule.ip = ipVal;
                     if (rule.description.empty()) {
-                        rule.description = targetHost;
-                    } else if (resolved != targetHost) {
-                        rule.description += " (" + targetHost + " -> " + resolved + ")";
+                        rule.description = !hostVal.empty() ? hostVal : ipVal;
                     }
+                    if (!hostVal.empty() && rule.description.find(hostVal) == std::string::npos) {
+                        rule.description += " (" + hostVal + " -> " + ipVal + ")";
+                    }
+                } else {
+                    std::string targetHost = !hostVal.empty() ? hostVal : ipVal;
+                    if (!targetHost.empty()) {
+                        std::string resolved = ResolveHostToIp(targetHost);
+                        rule.ip = resolved;
+                        if (rule.description.empty()) {
+                            rule.description = targetHost;
+                        } else if (resolved != targetHost) {
+                            rule.description += " (" + targetHost + " -> " + resolved + ")";
+                        }
+                    }
+                }
+
+                if (!rule.ip.empty()) {
                     outConfig.whitelist.push_back(rule);
+                }
+
+                // If hostVal is provided, also ensure it's in allowedDomainSuffixes so dynamic DNS / SRV / ports are whitelisted
+                if (!hostVal.empty()) {
+                    bool exists = false;
+                    for (const auto& s : outConfig.allowedDomainSuffixes) {
+                        if (s == hostVal) { exists = true; break; }
+                    }
+                    if (!exists) {
+                        outConfig.allowedDomainSuffixes.push_back(hostVal);
+                    }
                 }
 
                 objStart = objEnd + 1;
@@ -176,29 +232,6 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
                 std::string pattern = arrStr.substr(strPos + 1, end - strPos - 1);
                 if (!pattern.empty()) {
                     outConfig.sensitivePatterns.push_back(pattern);
-                }
-                strPos = end + 1;
-            }
-        }
-    }
-
-    // Parse allowed_domain_suffixes
-    size_t dsPos = configContent.find("\"allowed_domain_suffixes\"");
-    if (dsPos == std::string::npos) {
-        dsPos = configContent.find("\"domain_suffixes\"");
-    }
-    if (dsPos != std::string::npos) {
-        size_t arrStart = configContent.find('[', dsPos);
-        size_t arrEnd = configContent.find(']', arrStart);
-        if (arrStart != std::string::npos && arrEnd != std::string::npos) {
-            std::string arrStr = configContent.substr(arrStart, arrEnd - arrStart + 1);
-            size_t strPos = 0;
-            while ((strPos = arrStr.find('\"', strPos)) != std::string::npos) {
-                size_t end = arrStr.find('\"', strPos + 1);
-                if (end == std::string::npos) break;
-                std::string suffix = arrStr.substr(strPos + 1, end - strPos - 1);
-                if (!suffix.empty()) {
-                    outConfig.allowedDomainSuffixes.push_back(suffix);
                 }
                 strPos = end + 1;
             }

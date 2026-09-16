@@ -8,7 +8,10 @@
     "allowed_domain_suffixes": [
       "mojang.com",
       "minecraft.net",
-      "minecraftservices.com"
+      "minecraftservices.com",
+      "minecraft-services.net",
+      "3c3u.org",
+      "3c3u.icu"
     ],
     "whitelist": [
       {
@@ -18,10 +21,17 @@
         "protocol": "TCP"
       },
       {
-        "description": "3c3u Minecraft Server",
+        "description": "3c3u Minecraft Server (Main)",
         "host": "3c3u.org",
         "ip": "202.189.7.174",
         "port": 25565,
+        "protocol": "TCP"
+      },
+      {
+        "description": "3c3u Minecraft Server (Node / Proxy)",
+        "host": "3c3u.icu",
+        "ip": "180.188.24.125",
+        "port": 37900,
         "protocol": "TCP"
       }
     ]
