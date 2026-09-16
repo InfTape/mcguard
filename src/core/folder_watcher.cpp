@@ -38,6 +38,10 @@ void FolderWatcher::StopWatching() {
     if (!m_running) return;
     m_running = false;
 
+    if (m_thread.joinable()) {
+        CancelSynchronousIo(m_thread.native_handle());
+    }
+
     if (m_hDir != INVALID_HANDLE_VALUE) {
         CloseHandle(m_hDir);
         m_hDir = INVALID_HANDLE_VALUE;

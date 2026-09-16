@@ -126,7 +126,7 @@ std::string ConsoleView::TruncateMiddleOrPad(const std::string& str, size_t widt
     }
 }
 
-void ConsoleView::DisplayRecord(const core::AuditRecord& record) {
+void ConsoleView::DisplayRecord(const core::AuditRecord& record, bool writeToFile) {
     std::lock_guard<std::mutex> lock(m_renderMutex);
 
     std::string actionColor = "";
@@ -159,7 +159,7 @@ void ConsoleView::DisplayRecord(const core::AuditRecord& record) {
         typeColor = m_ansiSupported ? ANSI_YELLOW : "";
     } else if (record.type.find("WRITE") != std::string::npos || record.type.find("CREATE") != std::string::npos || record.type.find("DELETE") != std::string::npos) {
         typeColor = m_ansiSupported ? ANSI_MAGENTA : "";
-    } else if (record.type.find("PROCESS") != std::string::npos) {
+    } else if (record.type.find("PROCESS") != std::string::npos || record.type.find("PROC") != std::string::npos) {
         typeColor = m_ansiSupported ? ANSI_CYAN ANSI_BOLD : "";
     }
 
@@ -173,14 +173,68 @@ void ConsoleView::DisplayRecord(const core::AuditRecord& record) {
     }
 
     // Format console row
-    std::cout << TruncateOrPad(record.timestamp.substr(0, 8), 10) << " "
+    std::cout << TruncateOrPad(record.timestamp.length() >= 8 ? record.timestamp.substr(0, 8) : record.timestamp, 10) << " "
               << TruncateOrPad(std::to_string(record.pid), 7) << " "
               << typeColor << TruncateOrPad(record.type, 12) << (m_ansiSupported ? ANSI_RESET : "") << " "
               << TruncateMiddleOrPad(record.target, 44) << " "
               << actionColor << TruncateOrPad(actionBadge, 8) << (m_ansiSupported ? ANSI_RESET : "") << " "
               << sourceColor << record.source << (m_ansiSupported ? ANSI_RESET : "") << "\n" << std::flush;
 
-    WriteJsonLog(record);
+    if (writeToFile) {
+        WriteJsonLog(record);
+    }
+}
+
+bool ConsoleView::ParseJsonRecord(const std::string& line, core::AuditRecord& outRecord) {
+    if (line.empty() || line.find('{') == std::string::npos || line.find('}') == std::string::npos) return false;
+
+    auto extractString = [&](const std::string& key) -> std::string {
+        std::string pattern = "\"" + key + "\":\"";
+        size_t pos = line.find(pattern);
+        if (pos == std::string::npos) return "";
+        pos += pattern.length();
+        std::string val;
+        for (size_t i = pos; i < line.length(); ++i) {
+            if (line[i] == '\\' && i + 1 < line.length()) {
+                val += line[++i];
+            } else if (line[i] == '\"') {
+                break;
+            } else {
+                val += line[i];
+            }
+        }
+        return val;
+    };
+
+    auto extractNumber = [&](const std::string& key) -> DWORD {
+        std::string pattern = "\"" + key + "\":";
+        size_t pos = line.find(pattern);
+        if (pos == std::string::npos) return 0;
+        pos += pattern.length();
+        while (pos < line.length() && (line[pos] == ' ' || line[pos] == '\"')) pos++;
+        size_t end = pos;
+        while (end < line.length() && isdigit(line[end])) end++;
+        if (end > pos) {
+            return (DWORD)std::stoul(line.substr(pos, end - pos));
+        }
+        return 0;
+    };
+
+    outRecord.timestamp = extractString("timestamp");
+    outRecord.pid = extractNumber("pid");
+    outRecord.type = extractString("type");
+    outRecord.target = extractString("target");
+    outRecord.source = extractString("source");
+    outRecord.details = extractString("details");
+
+    std::string act = extractString("action");
+    if (act == "BLOCK") outRecord.action = core::AuditAction::BLOCK;
+    else if (act == "ALERT") outRecord.action = core::AuditAction::ALERT;
+    else if (act == "ALLOW") outRecord.action = core::AuditAction::ALLOW;
+    else outRecord.action = core::AuditAction::AUDIT;
+
+    outRecord.isSensitive = (line.find("\"sensitive\":true") != std::string::npos);
+    return true;
 }
 
 void ConsoleView::WriteJsonLog(const core::AuditRecord& record) {

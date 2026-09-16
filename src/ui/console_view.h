@@ -16,7 +16,10 @@ public:
     void Initialize();
 
     // Render a single audit record into the live console table and JSON log
-    void DisplayRecord(const core::AuditRecord& record);
+    void DisplayRecord(const core::AuditRecord& record, bool writeToFile = true);
+
+    // Parse a JSONL line back into an AuditRecord
+    static bool ParseJsonRecord(const std::string& line, core::AuditRecord& outRecord);
 
     // Print status / information banners
     void PrintStatus(const std::string& message);

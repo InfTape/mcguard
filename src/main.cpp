@@ -4,6 +4,7 @@
 #include <string>
 #include <csignal>
 #include <atomic>
+#include <conio.h>
 
 #include "util/privilege.h"
 #include "util/string_util.h"
@@ -49,6 +50,7 @@ void PrintUsage() {
               << "  watch              Auto-discover Minecraft (javaw.exe) and attach WFP + ETW + Module Audit\n"
               << "  run -- <exe> [args] Launch target inside Windows Kernel Restricted Sandbox (Low Integrity + Block Child Proc)\n"
               << "  sandbox [args]     Alias for 'run'\n"
+              << "  monitor            Real-time interactive security console window\n"
               << "  test-wfp           Test WFP ALE dynamic engine and rule installation\n"
               << "  demo               Run live demonstration of WFP blocking and native I/O audit\n\n"
               << "Options:\n"
@@ -96,6 +98,8 @@ int main(int argc, char* argv[]) {
     bool requestElevate = false;
     std::string targetExe;
     std::string targetCmdLine;
+    DWORD targetPid = 0;
+    std::string auditFilePath;
 
     // Determine whether MCGuard is being invoked with an explicit MCGuard subcommand
     // or as a Java executable proxy (by HMCL, PCL, or launcher)
@@ -103,7 +107,7 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         std::string firstArg = argv[1];
         if (firstArg == "watch" || firstArg == "run" || firstArg == "sandbox" ||
-            firstArg == "test-wfp" || firstArg == "demo" ||
+            firstArg == "monitor" || firstArg == "test-wfp" || firstArg == "demo" ||
             firstArg == "--help" || firstArg == "-h" ||
             firstArg == "--elevate" || firstArg == "--whitelist") {
             isExplicitCommand = true;
@@ -153,6 +157,17 @@ int main(int argc, char* argv[]) {
                 return 0;
             } else if (arg == "--elevate") {
                 requestElevate = true;
+            } else if (arg == "monitor") {
+                command = "monitor";
+                for (int m = i + 1; m < argc; ++m) {
+                    std::string mArg = argv[m];
+                    if (mArg == "--pid" && m + 1 < argc) {
+                        targetPid = (DWORD)std::stoul(argv[++m]);
+                    } else if (mArg == "--audit" && m + 1 < argc) {
+                        auditFilePath = argv[++m];
+                    }
+                }
+                break;
             } else if (arg == "run" || arg == "sandbox") {
                 command = "sandbox";
                 int targetIdx = i + 1;
@@ -194,25 +209,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // If launched headlessly or hidden by a launcher (such as HMCL or PCL), ensure monitoring console window is visible
+    // If running in an already interactive console, set title
     HWND hConsole = GetConsoleWindow();
-    if (hConsole == NULL || !IsWindowVisible(hConsole)) {
-        FreeConsole();
-        if (AllocConsole()) {
-            hConsole = GetConsoleWindow();
-            FILE* fpOut = nullptr;
-            FILE* fpErr = nullptr;
-            FILE* fpIn = nullptr;
-            freopen_s(&fpOut, "CONOUT$", "w", stdout);
-            freopen_s(&fpErr, "CONOUT$", "w", stderr);
-            freopen_s(&fpIn, "CONIN$", "r", stdin);
-            std::ios::sync_with_stdio(true);
-        }
-    }
-    if (hConsole != NULL) {
-        ShowWindow(hConsole, SW_SHOW);
-        ShowWindow(hConsole, SW_RESTORE);
-        SetForegroundWindow(hConsole);
+    if (hConsole != NULL && IsWindowVisible(hConsole)) {
         SetConsoleTitleW(L"MCGuard v1.1 - Minecraft Security Sandbox & Real-Time Monitor");
     }
 
@@ -240,6 +239,95 @@ int main(int argc, char* argv[]) {
     }
 
     ui::ConsoleView view("mcguard_audit.jsonl");
+
+    // Command: monitor (Dedicated real-time GUI / interactive console monitor)
+    if (command == "monitor") {
+        std::string logPath = auditFilePath.empty() ? "mcguard_audit.jsonl" : auditFilePath;
+        ui::ConsoleView monView(logPath);
+        monView.Initialize();
+
+        if (targetPid != 0) {
+            SetConsoleTitleW((L"MCGuard v1.1 - Minecraft Security Monitor & Real-Time Defense [PID: " + std::to_wstring(targetPid) + L"]").c_str());
+        } else {
+            SetConsoleTitleW(L"MCGuard v1.1 - Minecraft Security Monitor & Real-Time Defense");
+        }
+
+        monView.PrintStatus("MCGuard Interactive Security Console attached.");
+        if (targetPid != 0) {
+            monView.PrintStatus("Observing Sandboxed Minecraft Process (PID: " + std::to_string(targetPid) + ")");
+        }
+
+        HANDLE hProc = NULL;
+        if (targetPid != 0) {
+            hProc = OpenProcess(SYNCHRONIZE, FALSE, targetPid);
+        }
+
+        std::ifstream file;
+        std::streampos lastPos = 0;
+        uint64_t totalRecords = 0;
+
+        while (!g_exitRequested) {
+            if (!file.is_open()) {
+                file.open(monView.GetLogFilePath(), std::ios::in);
+            }
+
+            if (file.is_open()) {
+                file.clear();
+                file.seekg(lastPos);
+                std::string line;
+                while (std::getline(file, line)) {
+                    if (!line.empty()) {
+                        core::AuditRecord rec;
+                        if (ui::ConsoleView::ParseJsonRecord(line, rec)) {
+                            monView.DisplayRecord(rec, false /* do not re-write to file */);
+                            totalRecords++;
+                        }
+                    }
+                    lastPos = file.tellg();
+                }
+            }
+
+            // Check if target process has exited
+            if (hProc != NULL) {
+                DWORD waitRes = WaitForSingleObject(hProc, 250);
+                if (waitRes == WAIT_OBJECT_0) {
+                    // Drain any remaining records
+                    if (file.is_open()) {
+                        file.clear();
+                        file.seekg(lastPos);
+                        std::string line;
+                        while (std::getline(file, line)) {
+                            if (!line.empty()) {
+                                core::AuditRecord rec;
+                                if (ui::ConsoleView::ParseJsonRecord(line, rec)) {
+                                    monView.DisplayRecord(rec, false);
+                                    totalRecords++;
+                                }
+                            }
+                        }
+                    }
+
+                    monView.PrintSuccess("Minecraft Process (PID: " + std::to_string(targetPid) + ") has terminated.");
+                    monView.PrintStatus("Session summary: " + std::to_string(totalRecords) + " total security events recorded.");
+                    monView.PrintStatus("Window will close automatically in 5 seconds (or press any key)...");
+
+                    for (int s = 0; s < 50; ++s) {
+                        if (_kbhit()) {
+                            _getch();
+                            break;
+                        }
+                        Sleep(100);
+                    }
+                    break;
+                }
+            } else {
+                Sleep(250);
+            }
+        }
+
+        if (hProc) CloseHandle(hProc);
+        return 0;
+    }
 
     // Command: test-wfp
     if (command == "test-wfp") {
@@ -480,7 +568,35 @@ int main(int argc, char* argv[]) {
         });
         dnsTracker.PreResolveCommonEndpoints();
 
-        // 7. Resume sandboxed process thread
+        // 7. If running without a visible console window (e.g. launched by HMCL / PCL with CREATE_NO_WINDOW),
+        // spawn conhost.exe to display an independent, authentic, interactive monitor window on the desktop!
+        HWND hCurrentConsole = GetConsoleWindow();
+        if (hCurrentConsole == NULL || !IsWindowVisible(hCurrentConsole)) {
+            wchar_t sysDir[MAX_PATH];
+            GetSystemDirectoryW(sysDir, MAX_PATH);
+            std::wstring conhostPath = std::wstring(sysDir) + L"\\conhost.exe";
+
+            wchar_t exePath[MAX_PATH];
+            GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+            std::wstring monCmd = L"\"" + conhostPath + L"\" \"" + exePath + L"\" monitor --pid " +
+                                  std::to_wstring(procInfo.processId) + L" --audit \"" +
+                                  util::Utf8ToWide(view.GetLogFilePath()) + L"\"";
+            std::vector<wchar_t> monCmdBuf(monCmd.begin(), monCmd.end());
+            monCmdBuf.push_back(L'\0');
+
+            STARTUPINFOW monSi = { sizeof(monSi) };
+            monSi.dwFlags = STARTF_USESHOWWINDOW;
+            monSi.wShowWindow = SW_SHOWNORMAL;
+            PROCESS_INFORMATION monPi = { 0 };
+
+            if (CreateProcessW(conhostPath.c_str(), monCmdBuf.data(), NULL, NULL, FALSE, 0, NULL, NULL, &monSi, &monPi)) {
+                CloseHandle(monPi.hProcess);
+                CloseHandle(monPi.hThread);
+            }
+        }
+
+        // Resume sandboxed process thread
         core::SandboxLauncher::ResumeSandboxedProcess(procInfo);
         view.PrintSuccess("Sandboxed Minecraft is now running safely!\n");
         view.PrintStatus("Audit Log File: " + view.GetLogFilePath() + "\n");
