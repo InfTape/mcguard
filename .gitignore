@@ -1,0 +1,16 @@
+# Build output
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.res
+
+# Audit logs
+*.jsonl
+
+# IDE & temporary
+.vs/
+build/
+out/
+test/

@@ -1,0 +1,39 @@
+#pragma once
+#include "../core/correlator.h"
+#include <string>
+#include <mutex>
+#include <fstream>
+
+namespace mcguard {
+namespace ui {
+
+class ConsoleView {
+public:
+    ConsoleView(const std::string& logFilePath = "mcguard_audit.jsonl");
+    ~ConsoleView();
+
+    // Enable ANSI console colors and print header
+    void Initialize();
+
+    // Render a single audit record into the live console table and JSON log
+    void DisplayRecord(const core::AuditRecord& record);
+
+    // Print status / information banners
+    void PrintStatus(const std::string& message);
+    void PrintWarning(const std::string& message);
+    void PrintError(const std::string& message);
+    void PrintSuccess(const std::string& message);
+
+private:
+    void WriteJsonLog(const core::AuditRecord& record);
+    std::string TruncateOrPad(const std::string& str, size_t width, bool alignLeft = true);
+
+    std::string m_logFilePath;
+    std::ofstream m_logStream;
+    std::mutex m_renderMutex;
+    bool m_ansiSupported = false;
+    bool m_headerPrinted = false;
+};
+
+} // namespace ui
+} // namespace mcguard
