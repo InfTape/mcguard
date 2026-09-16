@@ -194,15 +194,22 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // If launched headlessly by a launcher (such as HMCL or PCL), allocate a dedicated monitoring console window
-    if (GetConsoleWindow() == NULL) {
+    // If launched headlessly or hidden by a launcher (such as HMCL or PCL), ensure monitoring console window is visible
+    HWND hConsole = GetConsoleWindow();
+    if (hConsole == NULL) {
         AllocConsole();
+        hConsole = GetConsoleWindow();
         FILE* fpOut = nullptr;
         FILE* fpErr = nullptr;
         FILE* fpIn = nullptr;
         freopen_s(&fpOut, "CONOUT$", "w", stdout);
         freopen_s(&fpErr, "CONOUT$", "w", stderr);
         freopen_s(&fpIn, "CONIN$", "r", stdin);
+    }
+    if (hConsole != NULL) {
+        ShowWindow(hConsole, SW_SHOW);
+        ShowWindow(hConsole, SW_RESTORE);
+        SetForegroundWindow(hConsole);
         SetConsoleTitleW(L"MCGuard v1.1 - Minecraft Security Sandbox & Real-Time Monitor");
     }
 
