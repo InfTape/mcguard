@@ -10,6 +10,7 @@ set(SOURCES
     src/main.cpp
     src/util/privilege.cpp
     src/util/string_util.cpp
+    src/util/config_loader.cpp
     src/core/process_watcher.cpp
     src/core/wfp_guard.cpp
     src/core/etw_watcher.cpp

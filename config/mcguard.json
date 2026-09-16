@@ -14,8 +14,9 @@
         "protocol": "TCP"
       },
       {
-        "description": "Example Target Server",
-        "ip": "1.2.3.4",
+        "description": "3c3u Minecraft Server",
+        "host": "3c3u.org",
+        "ip": "202.189.7.174",
         "port": 25565,
         "protocol": "TCP"
       }
@@ -35,9 +36,6 @@
       "Local State",
       "tokens.json"
     ]
-  },
-  "ipc": {
-    "pipe_name": "\\\\.\\pipe\\mcguard_ipc"
   },
   "logging": {
     "jsonl_output": "mcguard_audit.jsonl",

@@ -7,6 +7,7 @@
 
 #include "util/privilege.h"
 #include "util/string_util.h"
+#include "util/config_loader.h"
 #include "core/process_watcher.h"
 #include "core/wfp_guard.h"
 #include "core/etw_watcher.h"
@@ -58,14 +59,28 @@ int main(int argc, char* argv[]) {
     std::string command = "watch";
     std::vector<core::WhitelistRule> whitelist;
 
-    // Default whitelist: only local server 127.0.0.1:25565
-    // Note: No generic port 443 exception - all outbound remote traffic requires explicit whitelisting
-    core::WhitelistRule rLocal;
-    rLocal.description = "Local Server";
-    rLocal.ip = "127.0.0.1";
-    rLocal.port = 25565;
-    rLocal.protocol = "TCP";
-    whitelist.push_back(rLocal);
+    // Try loading configuration from config/mcguard.json
+    util::ConfigData cfg;
+    bool hasConfig = util::ConfigLoader::LoadConfig("", cfg);
+
+    if (hasConfig) {
+        whitelist = cfg.whitelist;
+    } else {
+        // Fallback default: only local server 127.0.0.1:25565
+        core::WhitelistRule rLocal;
+        rLocal.description = "Local Server";
+        rLocal.ip = "127.0.0.1";
+        rLocal.port = 25565;
+        rLocal.protocol = "TCP";
+        whitelist.push_back(rLocal);
+    }
+
+    // Always allow DNS queries (port 53 UDP) so Minecraft can resolve server hostnames
+    core::WhitelistRule rDns;
+    rDns.description = "DNS Resolution";
+    rDns.port = 53;
+    rDns.protocol = "UDP";
+    whitelist.push_back(rDns);
 
     bool requestElevate = false;
 
@@ -80,15 +95,18 @@ int main(int argc, char* argv[]) {
             std::string wp = argv[++i];
             size_t colon = wp.find(':');
             core::WhitelistRule r;
-            r.description = "User Whitelist";
             r.protocol = "TCP";
+            std::string hostOrIp;
             if (colon != std::string::npos) {
-                r.ip = wp.substr(0, colon);
+                hostOrIp = wp.substr(0, colon);
                 r.port = (uint16_t)std::stoi(wp.substr(colon + 1));
             } else {
-                r.ip = wp;
+                hostOrIp = wp;
                 r.port = 25565;
             }
+            // Automatically resolve domain name to IP if host provided
+            r.ip = util::ConfigLoader::ResolveHostToIp(hostOrIp);
+            r.description = "User Whitelist (" + hostOrIp + (r.ip != hostOrIp ? " -> " + r.ip : "") + ")";
             whitelist.push_back(r);
         } else if (arg[0] != '-') {
             command = arg;

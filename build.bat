@@ -25,6 +25,7 @@ cl.exe /std:c++17 /EHsc /O2 /W3 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 ^
     "%~dp0src\main.cpp" ^
     "%~dp0src\util\privilege.cpp" ^
     "%~dp0src\util\string_util.cpp" ^
+    "%~dp0src\util\config_loader.cpp" ^
     "%~dp0src\core\process_watcher.cpp" ^
     "%~dp0src\core\wfp_guard.cpp" ^
     "%~dp0src\core\etw_watcher.cpp" ^
