@@ -1,4 +1,5 @@
 #include "etw_watcher.h"
+#include "dns_tracker.h"
 #include "../util/string_util.h"
 #include <iostream>
 
@@ -15,6 +16,9 @@ static const GUID KernelFileProviderGuid =
 
 static const GUID KernelNetworkProviderGuid = 
     { 0x7dd42a49, 0x5329, 0x4832, { 0x8d, 0xfd, 0x43, 0xd9, 0x79, 0x15, 0x3a, 0x88 } };
+
+static const GUID DnsClientProviderGuid = 
+    { 0x1c95126e, 0x7eea, 0x49a9, { 0xa3, 0xfe, 0xa3, 0x78, 0xb0, 0x3d, 0xdb, 0x4d } };
 
 EtwWatcher* EtwWatcher::s_instance = nullptr;
 
@@ -88,6 +92,15 @@ bool EtwWatcher::Start(EventCallback callback) {
         (ULONGLONG)~0ULL, 0, 0, &params
     );
 
+    // Enable DNS Client provider (Operational keyword: 0x8000000000000000)
+    EnableTraceEx2(
+        m_sessionHandle,
+        &DnsClientProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATION,
+        0x8000000000000000ULL, 0, 0, &params
+    );
+
     m_running = true;
     m_workerThread = std::thread(&EtwWatcher::TraceWorkerThread, this, callback);
     return true;
@@ -138,13 +151,63 @@ void EtwWatcher::TraceWorkerThread(EventCallback callback) {
 VOID WINAPI EtwWatcher::EventRecordCallback(PEVENT_RECORD pEventRecord) {
     if (!s_instance || !pEventRecord) return;
 
+    const GUID& providerId = pEventRecord->EventHeader.ProviderId;
+
+    // 0. Check DNS Client Provider first (System-wide & Game DNS resolutions)
+    if (IsEqualGUID(providerId, DnsClientProviderGuid)) {
+        DWORD bufferSize = 0;
+        TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
+        if (bufferSize > 0) {
+            std::vector<BYTE> infoBuffer(bufferSize);
+            auto pInfo = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuffer.data());
+            if (TdhGetEventInformation(pEventRecord, 0, NULL, pInfo, &bufferSize) == ERROR_SUCCESS) {
+                std::wstring queryName;
+                std::wstring queryResults;
+                for (ULONG i = 0; i < pInfo->TopLevelPropertyCount; ++i) {
+                    LPWSTR propName = (LPWSTR)((PBYTE)pInfo + pInfo->EventPropertyInfoArray[i].NameOffset);
+                    if (_wcsicmp(propName, L"QueryName") == 0) {
+                        PROPERTY_DATA_DESCRIPTOR desc = { 0 };
+                        desc.PropertyName = (ULONGLONG)propName;
+                        desc.ArrayIndex = ULONG_MAX;
+                        DWORD propSize = 0;
+                        TdhGetPropertySize(pEventRecord, 0, NULL, 1, &desc, &propSize);
+                        if (propSize > 0) {
+                            std::vector<BYTE> propVal(propSize + 2, 0);
+                            if (TdhGetProperty(pEventRecord, 0, NULL, 1, &desc, propSize, propVal.data()) == ERROR_SUCCESS) {
+                                queryName = (LPWSTR)propVal.data();
+                            }
+                        }
+                    } else if (_wcsicmp(propName, L"QueryResults") == 0) {
+                        PROPERTY_DATA_DESCRIPTOR desc = { 0 };
+                        desc.PropertyName = (ULONGLONG)propName;
+                        desc.ArrayIndex = ULONG_MAX;
+                        DWORD propSize = 0;
+                        TdhGetPropertySize(pEventRecord, 0, NULL, 1, &desc, &propSize);
+                        if (propSize > 0) {
+                            std::vector<BYTE> propVal(propSize + 2, 0);
+                            if (TdhGetProperty(pEventRecord, 0, NULL, 1, &desc, propSize, propVal.data()) == ERROR_SUCCESS) {
+                                queryResults = (LPWSTR)propVal.data();
+                            }
+                        }
+                    }
+                }
+                if (!queryName.empty() && !queryResults.empty()) {
+                    DnsTracker::Instance().ParseAndRegisterDnsResults(
+                        util::WideToUtf8(queryName),
+                        util::WideToUtf8(queryResults)
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     DWORD pid = pEventRecord->EventHeader.ProcessId;
 
-    // Check if pid is monitored
+    // Check if pid is monitored for File / Network I/O
     {
         std::lock_guard<std::mutex> lock(s_instance->m_pidMutex);
         if (s_instance->m_targetPids.empty()) {
-            // If empty, no targets yet
             return;
         }
         if (s_instance->m_targetPids.find(pid) == s_instance->m_targetPids.end()) {
@@ -156,8 +219,6 @@ VOID WINAPI EtwWatcher::EventRecordCallback(PEVENT_RECORD pEventRecord) {
     ev.pid = pid;
     ev.tid = pEventRecord->EventHeader.ThreadId;
     ev.timestamp = util::GetCurrentTimeString();
-
-    const GUID& providerId = pEventRecord->EventHeader.ProviderId;
 
     // 1. Check File Events
     if (IsEqualGUID(providerId, KernelFileProviderGuid)) {

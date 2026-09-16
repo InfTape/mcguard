@@ -83,12 +83,12 @@ void ConsoleView::Initialize() {
               << TruncateOrPad("TIME", 10) << " "
               << TruncateOrPad("PID", 7) << " "
               << TruncateOrPad("TYPE", 12) << " "
-              << TruncateOrPad("TARGET", 38) << " "
+              << TruncateOrPad("TARGET", 44) << " "
               << TruncateOrPad("ACTION", 8) << " "
               << "SOURCE"
               << (m_ansiSupported ? ANSI_RESET : "") << "\n";
 
-    std::cout << std::string(90, '-') << "\n";
+    std::cout << std::string(96, '-') << "\n";
     m_headerPrinted = true;
 }
 
@@ -172,7 +172,7 @@ void ConsoleView::DisplayRecord(const core::AuditRecord& record) {
     std::cout << TruncateOrPad(record.timestamp.substr(0, 8), 10) << " "
               << TruncateOrPad(std::to_string(record.pid), 7) << " "
               << typeColor << TruncateOrPad(record.type, 12) << (m_ansiSupported ? ANSI_RESET : "") << " "
-              << TruncateMiddleOrPad(record.target, 38) << " "
+              << TruncateMiddleOrPad(record.target, 44) << " "
               << actionColor << TruncateOrPad(actionBadge, 8) << (m_ansiSupported ? ANSI_RESET : "") << " "
               << sourceColor << record.source << (m_ansiSupported ? ANSI_RESET : "") << "\n" << std::flush;
 

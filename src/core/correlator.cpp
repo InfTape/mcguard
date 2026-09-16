@@ -1,4 +1,5 @@
 #include "correlator.h"
+#include "dns_tracker.h"
 #include "../util/string_util.h"
 #include <algorithm>
 
@@ -99,6 +100,17 @@ void Correlator::OnEtwEvent(const EtwEvent& ev) {
                 record.action = AuditAction::BLOCK;
                 record.source = "Unauthorized Outbound (WFP Blocked)";
             }
+            // Format target with domain name / ASN organization if available
+            size_t colon = targetUtf8.rfind(':');
+            if (colon != std::string::npos) {
+                std::string ip = targetUtf8.substr(0, colon);
+                try {
+                    uint16_t port = (uint16_t)std::stoi(targetUtf8.substr(colon + 1));
+                    record.target = DnsTracker::Instance().FormatTarget(ip, port);
+                } catch (...) {
+                    record.target = targetUtf8;
+                }
+            }
             break;
         }
 
@@ -184,13 +196,13 @@ void Correlator::OnFolderEvent(DWORD pid, const std::wstring& filePath, const st
 }
 
 void Correlator::OnNetworkConnection(DWORD pid, const std::string& remoteIp, uint16_t remotePort) {
-    std::string target = remoteIp + ":" + std::to_string(remotePort);
+    std::string rawTarget = remoteIp + ":" + std::to_string(remotePort);
     AuditRecord record;
     record.timestamp = util::GetCurrentTimeString();
     record.pid = pid;
     record.type = "TCP_OUT";
-    record.target = target;
-    bool isAllowed = IsTargetWhitelisted(target);
+    record.target = DnsTracker::Instance().FormatTarget(remoteIp, remotePort);
+    bool isAllowed = IsTargetWhitelisted(rawTarget);
     if (isAllowed) {
         record.action = AuditAction::ALLOW;
         record.source = "Minecraft Server (Allowed)";
