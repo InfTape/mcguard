@@ -83,12 +83,12 @@ void ConsoleView::Initialize() {
               << TruncateOrPad("TIME", 10) << " "
               << TruncateOrPad("PID", 7) << " "
               << TruncateOrPad("TYPE", 12) << " "
-              << TruncateOrPad("TARGET", 36) << " "
+              << TruncateOrPad("TARGET", 38) << " "
               << TruncateOrPad("ACTION", 8) << " "
               << "SOURCE"
               << (m_ansiSupported ? ANSI_RESET : "") << "\n";
 
-    std::cout << std::string(88, '-') << "\n";
+    std::cout << std::string(90, '-') << "\n";
     m_headerPrinted = true;
 }
 
@@ -97,6 +97,24 @@ std::string ConsoleView::TruncateOrPad(const std::string& str, size_t width, boo
     if (str.length() > width) {
         if (width <= 3) return str.substr(0, width);
         return str.substr(0, width - 3) + "...";
+    }
+    size_t pad = width - str.length();
+    if (alignLeft) {
+        return str + std::string(pad, ' ');
+    } else {
+        return std::string(pad, ' ') + str;
+    }
+}
+
+std::string ConsoleView::TruncateMiddleOrPad(const std::string& str, size_t width, bool alignLeft) {
+    if (str.length() == width) return str;
+    if (str.length() > width) {
+        if (width <= 5) return str.substr(0, width);
+        // Retain 14 chars on left (e.g. drive/user) and the rest on right (filename/parent dir)
+        size_t leftLen = (width - 3) * 38 / 100;
+        if (leftLen < 4) leftLen = 4;
+        size_t rightLen = (width - 3) - leftLen;
+        return str.substr(0, leftLen) + "..." + str.substr(str.length() - rightLen);
     }
     size_t pad = width - str.length();
     if (alignLeft) {
@@ -154,7 +172,7 @@ void ConsoleView::DisplayRecord(const core::AuditRecord& record) {
     std::cout << TruncateOrPad(record.timestamp.substr(0, 8), 10) << " "
               << TruncateOrPad(std::to_string(record.pid), 7) << " "
               << typeColor << TruncateOrPad(record.type, 12) << (m_ansiSupported ? ANSI_RESET : "") << " "
-              << TruncateOrPad(record.target, 36) << " "
+              << TruncateMiddleOrPad(record.target, 38) << " "
               << actionColor << TruncateOrPad(actionBadge, 8) << (m_ansiSupported ? ANSI_RESET : "") << " "
               << sourceColor << record.source << (m_ansiSupported ? ANSI_RESET : "") << "\n" << std::flush;
 

@@ -27,6 +27,7 @@ public:
 private:
     void WriteJsonLog(const core::AuditRecord& record);
     std::string TruncateOrPad(const std::string& str, size_t width, bool alignLeft = true);
+    std::string TruncateMiddleOrPad(const std::string& str, size_t width, bool alignLeft = true);
 
     std::string m_logFilePath;
     std::ofstream m_logStream;
