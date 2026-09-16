@@ -63,11 +63,13 @@ void ConsoleView::Initialize() {
             fullLogPath = util::WideToUtf8(dir) + m_logFilePath;
         }
     }
+    m_fullLogPath = fullLogPath;
 
     // Open log file in append mode
     m_logStream.open(fullLogPath, std::ios::out | std::ios::app);
     if (!m_logStream.is_open()) {
         m_logStream.open(m_logFilePath, std::ios::out | std::ios::app);
+        m_fullLogPath = m_logFilePath;
     }
 
     std::cout << "\n";

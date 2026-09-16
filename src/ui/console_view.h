@@ -23,6 +23,8 @@ public:
     void PrintWarning(const std::string& message);
     void PrintError(const std::string& message);
     void PrintSuccess(const std::string& message);
+    // Return the resolved absolute path of the audit log
+    std::string GetLogFilePath() const { return m_fullLogPath; }
 
 private:
     void WriteJsonLog(const core::AuditRecord& record);
@@ -30,6 +32,7 @@ private:
     std::string TruncateMiddleOrPad(const std::string& str, size_t width, bool alignLeft = true);
 
     std::string m_logFilePath;
+    std::string m_fullLogPath;
     std::ofstream m_logStream;
     std::mutex m_renderMutex;
     bool m_ansiSupported = false;

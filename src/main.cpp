@@ -194,6 +194,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // If launched headlessly by a launcher (such as HMCL or PCL), allocate a dedicated monitoring console window
+    if (GetConsoleWindow() == NULL) {
+        AllocConsole();
+        FILE* fpOut = nullptr;
+        FILE* fpErr = nullptr;
+        FILE* fpIn = nullptr;
+        freopen_s(&fpOut, "CONOUT$", "w", stdout);
+        freopen_s(&fpErr, "CONOUT$", "w", stderr);
+        freopen_s(&fpIn, "CONIN$", "r", stdin);
+        SetConsoleTitleW(L"MCGuard v1.1 - Minecraft Security Sandbox & Real-Time Monitor");
+    }
+
     // Check Administrator Privilege
     bool isElevated = util::IsElevatedAdministrator();
     if (!isElevated) {
@@ -433,11 +445,78 @@ int main(int argc, char* argv[]) {
             view.DisplayRecord(rec);
         });
 
+        // Configure DnsTracker with domain suffixes and dynamic WFP whitelisting callback
+        auto& dnsTracker = core::DnsTracker::Instance();
+        if (hasConfig && !cfg.allowedDomainSuffixes.empty()) {
+            dnsTracker.ClearAllowedDomainSuffixes();
+            for (const auto& suffix : cfg.allowedDomainSuffixes) {
+                dnsTracker.AddAllowedDomainSuffix(suffix);
+            }
+        }
+        dnsTracker.SetWhitelistIpCallback([&wfp, &correlator, &view, &whitelist, isElevated](const std::string& domain, const std::string& ip) {
+            core::WhitelistRule rule;
+            rule.description = "Allowed Domain (" + domain + ")";
+            rule.ip = ip;
+            rule.port = 0; // Any port
+            rule.protocol = "TCP";
+
+            correlator.AddWhitelistRule(rule);
+            whitelist.push_back(rule);
+
+            if (isElevated && wfp.IsActive()) {
+                wfp.AddWhitelistRule(rule);
+            }
+            view.PrintSuccess("Dynamically Whitelisted Domain IP: " + ip + " (" + domain + ")");
+        });
+        dnsTracker.PreResolveCommonEndpoints();
+
         // 7. Resume sandboxed process thread
         core::SandboxLauncher::ResumeSandboxedProcess(procInfo);
         view.PrintSuccess("Sandboxed Minecraft is now running safely!\n");
+        view.PrintStatus("Audit Log File: " + view.GetLogFilePath() + "\n");
 
-        // 8. Start ETW & Network tracking
+        // Post Process Start event to Audit Log (matches Procmon)
+        core::AuditRecord startRec;
+        startRec.timestamp = util::GetCurrentTimeString();
+        startRec.pid = procInfo.processId;
+        startRec.type = "PROC_START";
+        startRec.target = util::WideToUtf8(wTargetExe);
+        startRec.action = core::AuditAction::AUDIT;
+        startRec.source = "Process Start";
+        startRec.details = "Sandboxed PID: " + std::to_string(procInfo.processId) + ", Integrity: LOW, ChildProcess: RESTRICTED";
+        correlator.PostAuditRecord(startRec);
+
+        core::AuditRecord sbRec;
+        sbRec.timestamp = util::GetCurrentTimeString();
+        sbRec.pid = procInfo.processId;
+        sbRec.type = "SANDBOX_INIT";
+        sbRec.target = "Windows Kernel SRM";
+        sbRec.action = core::AuditAction::AUDIT;
+        sbRec.source = "Sandbox Mitigation";
+        sbRec.details = "Job Object ActiveProcessLimit=1, Token Privileges Stripped";
+        correlator.PostAuditRecord(sbRec);
+
+        // 8. Start File / Directory Watcher on Minecraft game directory
+        core::FolderWatcher folderWatcher;
+        g_pFolderWatcher = &folderWatcher;
+        std::wstring watchDir = gameDir;
+        if (watchDir.empty()) {
+            wchar_t appData[MAX_PATH];
+            if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) {
+                watchDir = std::wstring(appData) + L"\\.minecraft";
+            }
+        }
+        if (!watchDir.empty()) {
+            folderWatcher.StartWatching(watchDir, procInfo.processId, [&correlator](const core::FileChangeEvent& ev) {
+                std::string opStr = "FILE_WRITE";
+                if (ev.opType == core::FileOpType::OP_CREATE) opStr = "FILE_CREATE";
+                else if (ev.opType == core::FileOpType::OP_DELETE) opStr = "FILE_DELETE";
+                correlator.OnFolderEvent(ev.pid, ev.filePath, opStr);
+            });
+            view.PrintStatus("Active Directory Watcher monitoring: " + util::WideToUtf8(watchDir));
+        }
+
+        // 9. Start ETW & Network tracking
         core::EtwWatcher etw;
         g_pEtw = &etw;
         if (isElevated) {
@@ -455,8 +534,13 @@ int main(int argc, char* argv[]) {
         netTracker.AddMonitoredPid(procInfo.processId);
 
         core::ModuleTracker modTracker;
+        auto initialMods = modTracker.GetThirdPartyModules(procInfo.processId);
+        for (const auto& m : initialMods) {
+            correlator.OnModuleLoaded(procInfo.processId, m);
+        }
 
         // Loop until process exits or user exits
+        uint32_t loopCounter = 0;
         while (!g_exitRequested) {
             DWORD waitRes = WaitForSingleObject(procInfo.hProcess, 500);
             if (waitRes == WAIT_OBJECT_0) {
@@ -466,12 +550,16 @@ int main(int argc, char* argv[]) {
                 break;
             }
 
-            // Periodically check for new loaded modules
-            modTracker.CheckForNewModules(procInfo.processId, [&correlator](DWORD pid, const core::LoadedModuleInfo& mod) {
-                correlator.OnModuleLoaded(pid, mod);
-            });
+            loopCounter++;
+            // Every 3 seconds, check for newly loaded native DLLs
+            if (loopCounter % 6 == 0) {
+                modTracker.CheckForNewModules(procInfo.processId, [&correlator](DWORD pid, const core::LoadedModuleInfo& mod) {
+                    correlator.OnModuleLoaded(pid, mod);
+                });
+            }
         }
 
+        folderWatcher.StopWatching();
         netTracker.StopPolling();
         if (isElevated) etw.Stop();
         wfp.Detach();
