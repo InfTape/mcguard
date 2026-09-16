@@ -41,6 +41,17 @@ void ConsoleView::Initialize() {
         }
     }
 
+    // Disable QuickEdit mode on stdin to prevent mouse clicks from freezing the console
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn != INVALID_HANDLE_VALUE) {
+        DWORD dwInMode = 0;
+        if (GetConsoleMode(hIn, &dwInMode)) {
+            dwInMode &= ~ENABLE_QUICK_EDIT_MODE;
+            dwInMode |= ENABLE_EXTENDED_FLAGS;
+            SetConsoleMode(hIn, dwInMode);
+        }
+    }
+
     // If relative path, place it in the same directory as the executable
     std::string fullLogPath = m_logFilePath;
     wchar_t exePath[MAX_PATH] = { 0 };
@@ -145,7 +156,7 @@ void ConsoleView::DisplayRecord(const core::AuditRecord& record) {
               << typeColor << TruncateOrPad(record.type, 12) << (m_ansiSupported ? ANSI_RESET : "") << " "
               << TruncateOrPad(record.target, 36) << " "
               << actionColor << TruncateOrPad(actionBadge, 8) << (m_ansiSupported ? ANSI_RESET : "") << " "
-              << sourceColor << record.source << (m_ansiSupported ? ANSI_RESET : "") << "\n";
+              << sourceColor << record.source << (m_ansiSupported ? ANSI_RESET : "") << "\n" << std::flush;
 
     WriteJsonLog(record);
 }
@@ -183,22 +194,22 @@ void ConsoleView::WriteJsonLog(const core::AuditRecord& record) {
 
 void ConsoleView::PrintStatus(const std::string& message) {
     std::lock_guard<std::mutex> lock(m_renderMutex);
-    std::cout << (m_ansiSupported ? ANSI_BLUE "[*] " ANSI_RESET : "[*] ") << message << "\n";
+    std::cout << (m_ansiSupported ? ANSI_BLUE "[*] " ANSI_RESET : "[*] ") << message << "\n" << std::flush;
 }
 
 void ConsoleView::PrintWarning(const std::string& message) {
     std::lock_guard<std::mutex> lock(m_renderMutex);
-    std::cout << (m_ansiSupported ? ANSI_YELLOW "[!] " ANSI_RESET : "[!] ") << message << "\n";
+    std::cout << (m_ansiSupported ? ANSI_YELLOW "[!] " ANSI_RESET : "[!] ") << message << "\n" << std::flush;
 }
 
 void ConsoleView::PrintError(const std::string& message) {
     std::lock_guard<std::mutex> lock(m_renderMutex);
-    std::cout << (m_ansiSupported ? ANSI_RED "[-] " ANSI_RESET : "[-] ") << message << "\n";
+    std::cout << (m_ansiSupported ? ANSI_RED "[-] " ANSI_RESET : "[-] ") << message << "\n" << std::flush;
 }
 
 void ConsoleView::PrintSuccess(const std::string& message) {
     std::lock_guard<std::mutex> lock(m_renderMutex);
-    std::cout << (m_ansiSupported ? ANSI_GREEN "[+] " ANSI_RESET : "[+] ") << message << "\n";
+    std::cout << (m_ansiSupported ? ANSI_GREEN "[+] " ANSI_RESET : "[+] ") << message << "\n" << std::flush;
 }
 
 } // namespace ui
