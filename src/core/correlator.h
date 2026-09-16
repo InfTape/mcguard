@@ -36,6 +36,7 @@ public:
 
     void SetSensitivePatterns(const std::vector<std::string>& patterns);
     void SetWhitelistRules(const std::vector<WhitelistRule>& whitelist);
+    void AddWhitelistRule(const WhitelistRule& rule);
     void SetAuditCallback(AuditCallback cb) { m_callback = cb; }
 
     // Feed events from ETW
@@ -61,6 +62,7 @@ private:
 
     std::vector<std::string> m_sensitivePatterns;
     std::vector<WhitelistRule> m_whitelist;
+    std::mutex m_rulesMutex;
     AuditCallback m_callback;
 };
 

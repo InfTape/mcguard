@@ -10,6 +10,7 @@ namespace util {
 struct ConfigData {
     std::vector<core::WhitelistRule> whitelist;
     std::vector<std::string> sensitivePatterns;
+    std::vector<std::string> allowedDomainSuffixes;
     bool allowLocalhost = true;
     bool allowDns = true;
 };

@@ -5,7 +5,12 @@
     "default_policy": "BLOCK",
     "allow_localhost": true,
     "allow_dns": true,
-    "allow_mojang_auth": false,
+    "allow_mojang_auth": true,
+    "allowed_domain_suffixes": [
+      "mojang.com",
+      "minecraft.net",
+      "minecraftservices.com"
+    ],
     "whitelist": [
       {
         "description": "Default Minecraft Local Server",

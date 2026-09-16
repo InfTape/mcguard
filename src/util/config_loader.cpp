@@ -182,6 +182,29 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         }
     }
 
+    // Parse allowed_domain_suffixes
+    size_t dsPos = configContent.find("\"allowed_domain_suffixes\"");
+    if (dsPos == std::string::npos) {
+        dsPos = configContent.find("\"domain_suffixes\"");
+    }
+    if (dsPos != std::string::npos) {
+        size_t arrStart = configContent.find('[', dsPos);
+        size_t arrEnd = configContent.find(']', arrStart);
+        if (arrStart != std::string::npos && arrEnd != std::string::npos) {
+            std::string arrStr = configContent.substr(arrStart, arrEnd - arrStart + 1);
+            size_t strPos = 0;
+            while ((strPos = arrStr.find('\"', strPos)) != std::string::npos) {
+                size_t end = arrStr.find('\"', strPos + 1);
+                if (end == std::string::npos) break;
+                std::string suffix = arrStr.substr(strPos + 1, end - strPos - 1);
+                if (!suffix.empty()) {
+                    outConfig.allowedDomainSuffixes.push_back(suffix);
+                }
+                strPos = end + 1;
+            }
+        }
+    }
+
     return true;
 }
 

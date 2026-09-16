@@ -15,6 +15,7 @@
 #include "core/folder_watcher.h"
 #include "core/module_tracker.h"
 #include "core/correlator.h"
+#include "core/dns_tracker.h"
 #include "ui/console_view.h"
 
 using namespace mcguard;
@@ -271,6 +272,37 @@ int main(int argc, char* argv[]) {
     correlator.SetAuditCallback([&view](const core::AuditRecord& rec) {
         view.DisplayRecord(rec);
     });
+
+    // Configure DnsTracker with domain suffixes and dynamic WFP whitelisting callback
+    auto& dnsTracker = core::DnsTracker::Instance();
+    if (hasConfig) {
+        for (const auto& suffix : cfg.allowedDomainSuffixes) {
+            dnsTracker.AddAllowedDomainSuffix(suffix);
+        }
+    }
+    // Ensure default mojang/minecraft suffixes are whitelisted
+    dnsTracker.AddAllowedDomainSuffix("mojang.com");
+    dnsTracker.AddAllowedDomainSuffix("minecraft.net");
+    dnsTracker.AddAllowedDomainSuffix("minecraftservices.com");
+
+    dnsTracker.SetWhitelistIpCallback([&wfp, &correlator, &view, &whitelist, isElevated](const std::string& domain, const std::string& ip) {
+        core::WhitelistRule rule;
+        rule.description = "Allowed Domain (" + domain + ")";
+        rule.ip = ip;
+        rule.port = 0; // Any port (HTTPS 443 / HTTP 80)
+        rule.protocol = "TCP";
+
+        correlator.AddWhitelistRule(rule);
+        whitelist.push_back(rule);
+
+        if (isElevated && wfp.IsActive()) {
+            wfp.AddWhitelistRule(rule);
+        }
+        view.PrintSuccess("Dynamically Whitelisted Domain IP: " + ip + " (" + domain + ")");
+    });
+
+    // Pre-resolve common Mojang & Minecraft services at startup
+    dnsTracker.PreResolveCommonEndpoints();
 
     // Start active TCP socket connection poller
     netTracker.StartPolling([&correlator](DWORD pid, const std::string& remoteIp, uint16_t remotePort, bool isNew) {

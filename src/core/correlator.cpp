@@ -21,7 +21,18 @@ void Correlator::SetSensitivePatterns(const std::vector<std::string>& patterns) 
 }
 
 void Correlator::SetWhitelistRules(const std::vector<WhitelistRule>& whitelist) {
+    std::lock_guard<std::mutex> lock(m_rulesMutex);
     m_whitelist = whitelist;
+}
+
+void Correlator::AddWhitelistRule(const WhitelistRule& rule) {
+    std::lock_guard<std::mutex> lock(m_rulesMutex);
+    for (const auto& r : m_whitelist) {
+        if (r.ip == rule.ip && r.port == rule.port && r.protocol == rule.protocol) {
+            return;
+        }
+    }
+    m_whitelist.push_back(rule);
 }
 
 bool Correlator::IsSensitiveFile(const std::string& path) {
@@ -39,6 +50,7 @@ bool Correlator::IsTargetWhitelisted(const std::string& target) {
         return true;
     }
 
+    std::lock_guard<std::mutex> lock(m_rulesMutex);
     for (const auto& rule : m_whitelist) {
         if (rule.ip.empty() && rule.port == 0) continue;
 
@@ -95,10 +107,10 @@ void Correlator::OnEtwEvent(const EtwEvent& ev) {
             bool isAllowed = IsTargetWhitelisted(targetUtf8);
             if (isAllowed) {
                 record.action = AuditAction::ALLOW;
-                record.source = "Minecraft Server (Allowed)";
+                record.source = "Minecraft (Allowed)";
             } else {
                 record.action = AuditAction::BLOCK;
-                record.source = "Unauthorized Outbound (WFP Blocked)";
+                record.source = "Unauthorized (Blocked)";
             }
             // Format target with domain name / ASN organization if available
             size_t colon = targetUtf8.rfind(':');
@@ -205,10 +217,10 @@ void Correlator::OnNetworkConnection(DWORD pid, const std::string& remoteIp, uin
     bool isAllowed = IsTargetWhitelisted(rawTarget);
     if (isAllowed) {
         record.action = AuditAction::ALLOW;
-        record.source = "Minecraft Server (Allowed)";
+        record.source = "Minecraft (Allowed)";
     } else {
         record.action = AuditAction::BLOCK;
-        record.source = "Unauthorized Outbound (WFP Blocked)";
+        record.source = "Unauthorized (Blocked)";
     }
 
     if (m_callback) {

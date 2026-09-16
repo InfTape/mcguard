@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <cstdint>
+#include <functional>
 
 namespace mcguard {
 namespace core {
@@ -17,7 +18,17 @@ struct KnownSubnet {
 
 class DnsTracker {
 public:
+    using WhitelistIpCallback = std::function<void(const std::string& domain, const std::string& ip)>;
+
     static DnsTracker& Instance();
+
+    // Whitelisted domain suffixes (e.g. "mojang.com", "minecraft.net", "minecraftservices.com")
+    void AddAllowedDomainSuffix(const std::string& suffix);
+    bool IsDomainWhitelisted(const std::string& domain) const;
+    const std::vector<std::string>& GetAllowedDomainSuffixes() const { return m_allowedSuffixes; }
+
+    // Register dynamic whitelist callback
+    void SetWhitelistIpCallback(WhitelistIpCallback cb) { m_whitelistCb = cb; }
 
     // Register a domain-to-IP resolution mapping
     void RegisterResolution(const std::string& domain, const std::string& ip);
@@ -38,6 +49,9 @@ public:
     // Asynchronously trigger reverse DNS (PTR) lookup
     void AsyncResolvePtr(const std::string& ip);
 
+    // Pre-resolve common Mojang & Minecraft services at startup
+    void PreResolveCommonEndpoints();
+
 private:
     DnsTracker();
     ~DnsTracker();
@@ -47,9 +61,12 @@ private:
     uint32_t Ipv4ToUint(const std::string& ip) const;
 
     std::unordered_map<std::string, std::string> m_ipToDomain;
+    std::unordered_set<std::string> m_whitelistedIps;
     std::unordered_set<std::string> m_pendingQueries;
+    std::vector<std::string> m_allowedSuffixes;
     std::vector<KnownSubnet> m_subnets;
-    std::mutex m_mutex;
+    WhitelistIpCallback m_whitelistCb;
+    mutable std::mutex m_mutex;
 };
 
 } // namespace core

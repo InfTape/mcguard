@@ -17,11 +17,55 @@ DnsTracker& DnsTracker::Instance() {
     return instance;
 }
 
+static std::string ToLowerString(const std::string& str) {
+    std::string s = str;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
 DnsTracker::DnsTracker() {
     InitKnownSubnets();
+
+    // Default allowed domain suffixes as requested
+    AddAllowedDomainSuffix("mojang.com");
+    AddAllowedDomainSuffix("minecraft.net");
+    AddAllowedDomainSuffix("minecraftservices.com");
 }
 
 DnsTracker::~DnsTracker() {}
+
+void DnsTracker::AddAllowedDomainSuffix(const std::string& suffix) {
+    if (suffix.empty()) return;
+    std::string s = ToLowerString(suffix);
+    if (s.front() == '.') s = s.substr(1);
+    if (!s.empty() && s.back() == '.') s.pop_back();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& existing : m_allowedSuffixes) {
+        if (existing == s) return;
+    }
+    m_allowedSuffixes.push_back(s);
+}
+
+bool DnsTracker::IsDomainWhitelisted(const std::string& domain) const {
+    if (domain.empty()) return false;
+    std::string lowerDomain = ToLowerString(domain);
+    if (!lowerDomain.empty() && lowerDomain.back() == '.') lowerDomain.pop_back();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& suffix : m_allowedSuffixes) {
+        if (lowerDomain == suffix) return true;
+
+        // Subdomain check with dot boundary (e.g. "api.minecraftservices.com" ends with ".minecraftservices.com")
+        if (lowerDomain.length() > suffix.length()) {
+            size_t offset = lowerDomain.length() - suffix.length();
+            if (lowerDomain[offset - 1] == '.' && lowerDomain.substr(offset) == suffix) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 uint32_t DnsTracker::Ipv4ToUint(const std::string& ip) const {
     in_addr addr;
@@ -115,8 +159,22 @@ void DnsTracker::RegisterResolution(const std::string& domain, const std::string
         cleanDomain.pop_back();
     }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_ipToDomain[ip] = cleanDomain;
+    bool shouldWhitelist = IsDomainWhitelisted(cleanDomain);
+    bool isNewWhitelistedIp = false;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_ipToDomain[ip] = cleanDomain;
+
+        if (shouldWhitelist && m_whitelistedIps.find(ip) == m_whitelistedIps.end()) {
+            m_whitelistedIps.insert(ip);
+            isNewWhitelistedIp = true;
+        }
+    }
+
+    if (isNewWhitelistedIp && m_whitelistCb) {
+        m_whitelistCb(cleanDomain, ip);
+    }
 }
 
 void DnsTracker::RegisterResolution(const std::string& domain, const std::vector<std::string>& ips) {
@@ -191,8 +249,7 @@ void DnsTracker::AsyncResolvePtr(const std::string& ip) {
             if (getnameinfo((sockaddr*)&sa, sizeof(sa), host, sizeof(host), NULL, 0, NI_NAMEREQD) == 0) {
                 std::string domain(host);
                 if (!domain.empty()) {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    m_ipToDomain[ip] = domain;
+                    RegisterResolution(domain, ip);
                 }
             }
         }
@@ -220,6 +277,42 @@ std::string DnsTracker::FormatTarget(const std::string& ip, uint16_t port) {
     }
 
     return ip + ":" + std::to_string(port);
+}
+
+void DnsTracker::PreResolveCommonEndpoints() {
+    const std::vector<std::string> endpoints = {
+        "api.minecraftservices.com",
+        "sessionserver.mojang.com",
+        "authserver.mojang.com",
+        "launchermeta.mojang.com",
+        "pc.realms.minecraft.net",
+        "libraries.minecraft.net",
+        "textures.minecraft.net",
+        "skins.minecraft.net",
+        "piston-meta.mojang.com",
+        "launcher.mojang.com"
+    };
+
+    std::thread([this, endpoints]() {
+        struct addrinfo hints = { 0 };
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        for (const auto& ep : endpoints) {
+            struct addrinfo* pRes = NULL;
+            int err = getaddrinfo(ep.c_str(), NULL, &hints, &pRes);
+            if (err == 0 && pRes) {
+                for (auto p = pRes; p != NULL; p = p->ai_next) {
+                    char ipStr[INET_ADDRSTRLEN] = { 0 };
+                    auto sIn = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+                    if (inet_ntop(AF_INET, &sIn->sin_addr, ipStr, sizeof(ipStr))) {
+                        RegisterResolution(ep, std::string(ipStr));
+                    }
+                }
+                freeaddrinfo(pRes);
+            }
+        }
+    }).detach();
 }
 
 } // namespace core
