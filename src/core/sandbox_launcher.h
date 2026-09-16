@@ -45,6 +45,12 @@ public:
     // Cleanup handles associated with the sandbox process
     static void CleanupProcessInfo(SandboxProcessInfo& procInfo);
 
+    // Auto-detect system installed Java runtime
+    static std::wstring AutoDetectRealJava(const std::string& configuredPath, bool preferConsole);
+
+    // Forward a Java probe/info command synchronously with direct handle inheritance
+    static int RunJavaProbe(const std::wstring& javaExe, int argc, char* argv[]);
+
 private:
     static HANDLE CreateLowIntegrityRestrictedToken(bool stripPrivileges, bool lowIntegrity, std::string& outError);
 };

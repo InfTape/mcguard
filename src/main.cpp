@@ -97,10 +97,45 @@ int main(int argc, char* argv[]) {
     std::string targetExe;
     std::string targetCmdLine;
 
-    // Check if launched as a direct Java wrapper (e.g. HMCL called MCGuard with JVM args: -Xmx... or -D...)
-    if (argc > 1 && argv[1][0] == '-' && (std::string(argv[1]).rfind("-X", 0) == 0 || std::string(argv[1]).rfind("-D", 0) == 0)) {
+    // Determine whether MCGuard is being invoked with an explicit MCGuard subcommand
+    // or as a Java executable proxy (by HMCL, PCL, or launcher)
+    bool isExplicitCommand = false;
+    if (argc > 1) {
+        std::string firstArg = argv[1];
+        if (firstArg == "watch" || firstArg == "run" || firstArg == "sandbox" ||
+            firstArg == "test-wfp" || firstArg == "demo" ||
+            firstArg == "--help" || firstArg == "-h" ||
+            firstArg == "--elevate" || firstArg == "--whitelist") {
+            isExplicitCommand = true;
+        }
+    }
+
+    if (!isExplicitCommand && argc > 1) {
+        // Invoked as Java proxy!
+        // 1. Check if this is a Java information / probe query (e.g. HMCL or CLI probing version/properties)
+        bool isProbe = false;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "org.glavo.info.Main" ||
+                a == "-version" || a == "--version" ||
+                a == "-showversion" || a == "-fullversion" ||
+                a.rfind("-XshowSettings", 0) == 0 ||
+                a == "-help" || a == "-?") {
+                isProbe = true;
+                break;
+            }
+        }
+
+        if (isProbe) {
+            // Forward directly to real java.exe without any MCGuard output
+            std::wstring realJava = core::SandboxLauncher::AutoDetectRealJava(cfg.sandbox.realJavaPath, true /* prefer console java.exe */);
+            return core::SandboxLauncher::RunJavaProbe(realJava, argc, argv);
+        }
+
+        // 2. Otherwise, this is a Minecraft Game Launch!
         command = "sandbox";
-        targetExe = cfg.sandbox.realJavaPath.empty() ? "java.exe" : cfg.sandbox.realJavaPath;
+        std::wstring realJava = core::SandboxLauncher::AutoDetectRealJava(cfg.sandbox.realJavaPath, false /* prefer javaw.exe */);
+        targetExe = util::WideToUtf8(realJava);
         targetCmdLine = "\"" + targetExe + "\" ";
         for (int k = 1; k < argc; ++k) {
             std::string a = argv[k];
@@ -110,7 +145,7 @@ int main(int argc, char* argv[]) {
                 targetCmdLine += a + " ";
             }
         }
-    } else {
+    } else if (isExplicitCommand) {
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
@@ -300,9 +335,12 @@ int main(int argc, char* argv[]) {
         view.PrintStatus("Initializing MCGuard Kernel Restricted Sandbox...");
 
         if (targetExe.empty()) {
-            view.PrintError("No target executable specified to run in sandbox.");
-            view.PrintStatus("Usage: MCGuard.exe run -- <path_to_java.exe> [arguments...]");
-            return 1;
+            std::wstring realJava = core::SandboxLauncher::AutoDetectRealJava(cfg.sandbox.realJavaPath, false);
+            targetExe = util::WideToUtf8(realJava);
+            if (targetCmdLine.empty()) {
+                targetCmdLine = "\"" + targetExe + "\"";
+            }
+            view.PrintStatus("Auto-detected Real Java: " + targetExe);
         }
 
         std::wstring wTargetExe = util::Utf8ToWide(targetExe);

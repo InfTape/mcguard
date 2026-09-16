@@ -250,5 +250,151 @@ void SandboxLauncher::CleanupProcessInfo(SandboxProcessInfo& procInfo) {
     procInfo.threadId = 0;
 }
 
+static bool CheckFileExists(const std::wstring& path) {
+    DWORD dwAttrib = GetFileAttributesW(path.c_str());
+    return (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+std::wstring SandboxLauncher::AutoDetectRealJava(const std::string& configuredPath, bool preferConsole) {
+    // 1. If configuredPath is provided and valid, use it
+    if (!configuredPath.empty()) {
+        std::wstring wPath = util::Utf8ToWide(configuredPath);
+        if (CheckFileExists(wPath)) {
+            if (preferConsole) {
+                // If it ends with javaw.exe, try sibling java.exe so console probes produce stdout
+                size_t pos = wPath.rfind(L"javaw.exe");
+                if (pos != std::wstring::npos) {
+                    std::wstring consoleJava = wPath.substr(0, pos) + L"java.exe";
+                    if (CheckFileExists(consoleJava)) return consoleJava;
+                }
+            } else {
+                // If it ends with java.exe, try sibling javaw.exe
+                size_t pos = wPath.rfind(L"java.exe");
+                if (pos != std::wstring::npos && (pos == 0 || wPath[pos - 1] != L'w')) {
+                    std::wstring guiJava = wPath.substr(0, pos) + L"javaw.exe";
+                    if (CheckFileExists(guiJava)) return guiJava;
+                }
+            }
+            return wPath;
+        }
+    }
+
+    // 2. Check JAVA_HOME environment variable
+    wchar_t javaHome[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableW(L"JAVA_HOME", javaHome, MAX_PATH) > 0) {
+        std::wstring target = std::wstring(javaHome) + (preferConsole ? L"\\bin\\java.exe" : L"\\bin\\javaw.exe");
+        if (CheckFileExists(target)) return target;
+        std::wstring fallback = std::wstring(javaHome) + (preferConsole ? L"\\bin\\javaw.exe" : L"\\bin\\java.exe");
+        if (CheckFileExists(fallback)) return fallback;
+    }
+
+    // 3. Scan common standard JDK installation locations
+    const std::wstring searchRoots[] = {
+        L"C:\\Program Files\\Microsoft\\",
+        L"C:\\Program Files\\Eclipse Adoptium\\",
+        L"C:\\Program Files\\Java\\",
+        L"C:\\Program Files\\BellSoft\\",
+        L"C:\\Program Files\\Zulu\\"
+    };
+
+    std::wstring bestCandidate;
+    int bestVersion = 0;
+
+    for (const auto& root : searchRoots) {
+        std::wstring searchPattern = root + L"*";
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                    std::wstring candidate = root + fd.cFileName + (preferConsole ? L"\\bin\\java.exe" : L"\\bin\\javaw.exe");
+                    if (CheckFileExists(candidate)) {
+                        int ver = 0;
+                        const wchar_t* p = wcsstr(fd.cFileName, L"jdk-");
+                        if (!p) p = wcsstr(fd.cFileName, L"jdk");
+                        if (p) {
+                            while (*p && (*p < L'0' || *p > L'9')) p++;
+                            if (*p) ver = _wtoi(p);
+                        }
+                        if (ver == 21) {
+                            // Java 21 is modern Minecraft's target LTS version
+                            FindClose(hFind);
+                            return candidate;
+                        }
+                        if (ver > bestVersion || bestCandidate.empty()) {
+                            bestVersion = ver;
+                            bestCandidate = candidate;
+                        }
+                    }
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
+    if (!bestCandidate.empty()) {
+        return bestCandidate;
+    }
+
+    // 4. Check system PATH
+    wchar_t pathBuf[MAX_PATH] = { 0 };
+    if (SearchPathW(NULL, preferConsole ? L"java.exe" : L"javaw.exe", NULL, MAX_PATH, pathBuf, NULL) > 0) {
+        wchar_t currentExe[MAX_PATH] = { 0 };
+        GetModuleFileNameW(NULL, currentExe, MAX_PATH);
+        if (_wcsicmp(pathBuf, currentExe) != 0) {
+            return std::wstring(pathBuf);
+        }
+    }
+
+    return preferConsole ? L"java.exe" : L"javaw.exe";
+}
+
+int SandboxLauncher::RunJavaProbe(const std::wstring& javaExe, int argc, char* argv[]) {
+    std::wstring cmdLine = L"\"" + javaExe + L"\"";
+    for (int i = 1; i < argc; ++i) {
+        std::wstring wArg = util::Utf8ToWide(argv[i]);
+        if (wArg.find(L' ') != std::wstring::npos) {
+            cmdLine += L" \"" + wArg + L"\"";
+        } else {
+            cmdLine += L" " + wArg;
+        }
+    }
+
+    STARTUPINFOW si = { 0 };
+    si.cb = sizeof(si);
+    GetStartupInfoW(&si);
+
+    PROCESS_INFORMATION pi = { 0 };
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    // Launch real java with handle inheritance enabled so output streams directly to caller (HMCL)
+    BOOL ok = CreateProcessW(
+        NULL,
+        cmdBuf.data(),
+        NULL,
+        NULL,
+        TRUE,
+        0,
+        NULL,
+        NULL,
+        &si,
+        &pi
+    );
+
+    if (!ok) {
+        return 1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return (int)exitCode;
+}
+
 } // namespace core
 } // namespace mcguard
