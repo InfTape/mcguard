@@ -121,6 +121,12 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         outConfig.allowLocalhost = (allowLocalStr == "true");
     }
 
+    // Parse allow_lan
+    std::string allowLanStr = FindJsonFieldValue(configContent, "allow_lan");
+    if (!allowLanStr.empty()) {
+        outConfig.allowLan = (allowLanStr == "true");
+    }
+
     // Parse allowed_domain_suffixes first
     size_t dsPos = configContent.find("\"allowed_domain_suffixes\"");
     if (dsPos == std::string::npos) {
@@ -161,21 +167,25 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
                 core::WhitelistRule rule;
                 rule.description = FindJsonFieldValue(objStr, "description");
                 rule.protocol = FindJsonFieldValue(objStr, "protocol");
-                if (rule.protocol.empty()) rule.protocol = "TCP";
 
                 std::string hostVal = FindJsonFieldValue(objStr, "host");
                 std::string ipVal = FindJsonFieldValue(objStr, "ip");
                 std::string portStr = FindJsonFieldValue(objStr, "port");
 
+                // Check if ipVal is a valid IPv4 address or CIDR subnet
+                uint32_t subnetHost = 0, maskHost = 0;
+                bool isCidr = false;
+                bool ipValValid = !ipVal.empty() && util::ParseIpOrCidr(ipVal, subnetHost, maskHost, isCidr);
+
                 if (!portStr.empty()) {
-                    try { rule.port = (uint16_t)std::stoi(portStr); } catch (...) { rule.port = 25565; }
+                    try { rule.port = (uint16_t)std::stoi(portStr); } catch (...) { rule.port = isCidr ? 0 : 25565; }
                 } else {
-                    rule.port = 25565;
+                    rule.port = isCidr ? 0 : 25565;
                 }
 
-                // If ipVal is a valid IPv4 address, use it directly!
-                IN_ADDR inAddr;
-                bool ipValValid = !ipVal.empty() && (inet_pton(AF_INET, ipVal.c_str(), &inAddr) == 1);
+                if (rule.protocol.empty()) {
+                    rule.protocol = isCidr ? "ANY" : "TCP";
+                }
 
                 if (ipValValid) {
                     rule.ip = ipVal;
@@ -214,6 +224,29 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
                 }
 
                 objStart = objEnd + 1;
+            }
+        }
+    }
+
+    // If allowLan is enabled, ensure RFC 1918 private subnets are in whitelist
+    if (outConfig.allowLan) {
+        const std::pair<std::string, std::string> lanSubnets[] = {
+            {"192.168.0.0/16", "LAN Private Subnet (192.168.0.0/16)"},
+            {"10.0.0.0/8", "LAN Private Subnet (10.0.0.0/8)"},
+            {"172.16.0.0/12", "LAN Private Subnet (172.16.0.0/12)"}
+        };
+        for (const auto& item : lanSubnets) {
+            bool exists = false;
+            for (const auto& r : outConfig.whitelist) {
+                if (r.ip == item.first) { exists = true; break; }
+            }
+            if (!exists) {
+                core::WhitelistRule rule;
+                rule.description = item.second;
+                rule.ip = item.first;
+                rule.port = 0;
+                rule.protocol = "ANY";
+                outConfig.whitelist.push_back(rule);
             }
         }
     }

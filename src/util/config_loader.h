@@ -13,6 +13,7 @@ struct ConfigData {
     std::vector<std::string> allowedDomainSuffixes;
     std::vector<std::string> allowedFolders;
     bool allowLocalhost = true;
+    bool allowLan = true;
     bool allowDns = true;
     bool autoWhitelistGameDir = true;
 };

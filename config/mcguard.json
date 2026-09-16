@@ -20,6 +20,24 @@
         "protocol": "TCP"
       },
       {
+        "description": "LAN Private Subnet (192.168.0.0/16)",
+        "ip": "192.168.0.0/16",
+        "port": 0,
+        "protocol": "ANY"
+      },
+      {
+        "description": "LAN Private Subnet (10.0.0.0/8)",
+        "ip": "10.0.0.0/8",
+        "port": 0,
+        "protocol": "ANY"
+      },
+      {
+        "description": "LAN Private Subnet (172.16.0.0/12)",
+        "ip": "172.16.0.0/12",
+        "port": 0,
+        "protocol": "ANY"
+      },
+      {
         "description": "3c3u Minecraft Server",
         "host": "3c3u.org",
         "ip": "202.189.7.174",

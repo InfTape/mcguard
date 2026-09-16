@@ -122,8 +122,15 @@ bool Correlator::IsSensitiveFile(const std::string& path) {
 }
 
 bool Correlator::IsTargetWhitelisted(const std::string& target) {
+    size_t colon = target.rfind(':');
+    std::string targetIp = (colon != std::string::npos) ? target.substr(0, colon) : target;
+    uint16_t targetPort = 0;
+    if (colon != std::string::npos) {
+        try { targetPort = (uint16_t)std::stoi(target.substr(colon + 1)); } catch (...) { targetPort = 0; }
+    }
+
     // Localhost always allowed
-    if (target.find("127.0.0.1") != std::string::npos || target.find("localhost") != std::string::npos) {
+    if (targetIp == "127.0.0.1" || targetIp == "localhost" || target.find("127.0.0.1") != std::string::npos) {
         return true;
     }
 
@@ -132,8 +139,18 @@ bool Correlator::IsTargetWhitelisted(const std::string& target) {
         for (const auto& rule : m_whitelist) {
             if (rule.ip.empty() && rule.port == 0) continue;
 
-            bool ipMatch = rule.ip.empty() || (target.find(rule.ip) != std::string::npos);
-            bool portMatch = (rule.port == 0) || (target.find(":" + std::to_string(rule.port)) != std::string::npos);
+            bool ipMatch = false;
+            if (rule.ip.empty()) {
+                ipMatch = true;
+            } else if (rule.ip.find('/') != std::string::npos) {
+                // CIDR subnet match
+                ipMatch = util::IsIpInCidr(targetIp, rule.ip);
+            } else {
+                // Exact IP or substring match
+                ipMatch = (targetIp == rule.ip) || (target.find(rule.ip) != std::string::npos);
+            }
+
+            bool portMatch = (rule.port == 0) || (targetPort > 0 && targetPort == rule.port) || (target.find(":" + std::to_string(rule.port)) != std::string::npos);
 
             if (ipMatch && portMatch) {
                 return true;
@@ -142,9 +159,7 @@ bool Correlator::IsTargetWhitelisted(const std::string& target) {
     }
 
     // Secondary check: Has DnsTracker recorded a whitelisted domain for this IP?
-    size_t colon = target.rfind(':');
-    std::string ip = (colon != std::string::npos) ? target.substr(0, colon) : target;
-    std::string domain = DnsTracker::Instance().GetDomain(ip);
+    std::string domain = DnsTracker::Instance().GetDomain(targetIp);
     if (!domain.empty() && DnsTracker::Instance().IsDomainWhitelisted(domain)) {
         return true;
     }

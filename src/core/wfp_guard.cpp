@@ -179,15 +179,25 @@ bool WfpGuard::AddPermitRule(const WhitelistRule& rule, uint8_t weight) {
     condApp.conditionValue.byteBlob = m_appId;
     conditions.push_back(condApp);
 
-    // Condition 1: Remote IP
+    // Condition 1: Remote IP or CIDR Subnet
+    FWP_V4_ADDR_AND_MASK addrMask = { 0 };
     if (!rule.ip.empty()) {
-        uint32_t ipNetworkOrder = util::StringToIpv4(rule.ip);
-        if (ipNetworkOrder != 0) {
+        uint32_t ipHost = 0, maskHost = 0;
+        bool isCidr = false;
+        if (util::ParseIpOrCidr(rule.ip, ipHost, maskHost, isCidr)) {
             FWPM_FILTER_CONDITION0 condIp = { 0 };
             condIp.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
             condIp.matchType = FWP_MATCH_EQUAL;
-            condIp.conditionValue.type = FWP_UINT32;
-            condIp.conditionValue.uint32 = ntohl(ipNetworkOrder); // Host byte order required by WFP
+
+            if (isCidr) {
+                addrMask.addr = ipHost;
+                addrMask.mask = maskHost;
+                condIp.conditionValue.type = FWP_V4_ADDR_MASK;
+                condIp.conditionValue.v4AddrMask = &addrMask;
+            } else {
+                condIp.conditionValue.type = FWP_UINT32;
+                condIp.conditionValue.uint32 = ipHost; // Host byte order required by WFP
+            }
             conditions.push_back(condIp);
         }
     }

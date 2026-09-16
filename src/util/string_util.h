@@ -24,6 +24,10 @@ std::string Ipv4ToString(uint32_t ipBigEndian);
 uint32_t StringToIpv4(const std::string& ipStr);
 std::string Ipv6ToString(const uint8_t* ipv6Bytes);
 
+// CIDR & Subnet helpers (host byte order)
+bool ParseIpOrCidr(const std::string& input, uint32_t& outIpHostOrder, uint32_t& outMaskHostOrder, bool& outIsCidr);
+bool IsIpInCidr(const std::string& ipStr, const std::string& cidrOrIp);
+
 // Current timestamp formatting
 std::string GetCurrentTimeString();
 

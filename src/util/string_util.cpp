@@ -122,6 +122,72 @@ std::string Ipv6ToString(const uint8_t* ipv6Bytes) {
     return "::";
 }
 
+bool ParseIpOrCidr(const std::string& input, uint32_t& outIpHostOrder, uint32_t& outMaskHostOrder, bool& outIsCidr) {
+    if (input.empty()) return false;
+
+    size_t slashPos = input.find('/');
+    if (slashPos != std::string::npos) {
+        std::string ipPart = input.substr(0, slashPos);
+        std::string prefixPart = input.substr(slashPos + 1);
+
+        IN_ADDR addr;
+        if (inet_pton(AF_INET, ipPart.c_str(), &addr) != 1) {
+            return false;
+        }
+
+        int prefix = 0;
+        try {
+            prefix = std::stoi(prefixPart);
+        } catch (...) {
+            return false;
+        }
+
+        if (prefix < 0 || prefix > 32) {
+            return false;
+        }
+
+        uint32_t mask = 0;
+        if (prefix == 0) {
+            mask = 0;
+        } else if (prefix == 32) {
+            mask = 0xFFFFFFFF;
+        } else {
+            mask = (~0u) << (32 - prefix);
+        }
+
+        uint32_t ipHost = ntohl(addr.S_un.S_addr);
+        outIpHostOrder = ipHost & mask;
+        outMaskHostOrder = mask;
+        outIsCidr = true;
+        return true;
+    } else {
+        IN_ADDR addr;
+        if (inet_pton(AF_INET, input.c_str(), &addr) == 1) {
+            outIpHostOrder = ntohl(addr.S_un.S_addr);
+            outMaskHostOrder = 0xFFFFFFFF;
+            outIsCidr = false;
+            return true;
+        }
+        return false;
+    }
+}
+
+bool IsIpInCidr(const std::string& ipStr, const std::string& cidrOrIp) {
+    uint32_t ipSubnet = 0, ipMask = 0;
+    bool isCidr = false;
+    if (!ParseIpOrCidr(cidrOrIp, ipSubnet, ipMask, isCidr)) {
+        return false;
+    }
+
+    IN_ADDR targetAddr;
+    if (inet_pton(AF_INET, ipStr.c_str(), &targetAddr) != 1) {
+        return false;
+    }
+
+    uint32_t targetHostOrder = ntohl(targetAddr.S_un.S_addr);
+    return (targetHostOrder & ipMask) == (ipSubnet & ipMask);
+}
+
 std::string GetCurrentTimeString() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
