@@ -11,7 +11,9 @@ namespace core {
 
 struct MinecraftProcessInfo {
     DWORD pid = 0;
+    DWORD parentPid = 0;
     std::wstring exePath;
+    std::wstring javaHome;
     std::wstring commandLine;
     std::wstring gameDir;
     std::wstring version;

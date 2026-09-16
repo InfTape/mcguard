@@ -11,8 +11,10 @@ struct ConfigData {
     std::vector<core::WhitelistRule> whitelist;
     std::vector<std::string> sensitivePatterns;
     std::vector<std::string> allowedDomainSuffixes;
+    std::vector<std::string> allowedFolders;
     bool allowLocalhost = true;
     bool allowDns = true;
+    bool autoWhitelistGameDir = true;
 };
 
 class ConfigLoader {

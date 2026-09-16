@@ -31,6 +31,8 @@
   "file_audit": {
     "enabled": true,
     "highlight_sensitive": true,
+    "auto_whitelist_game_dir": true,
+    "allowed_folders": [],
     "sensitive_patterns": [
       ".ssh",
       "id_rsa",

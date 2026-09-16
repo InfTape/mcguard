@@ -238,6 +238,32 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         }
     }
 
+    // Parse auto_whitelist_game_dir
+    std::string autoWlStr = FindJsonFieldValue(configContent, "auto_whitelist_game_dir");
+    if (!autoWlStr.empty()) {
+        outConfig.autoWhitelistGameDir = (autoWlStr == "true");
+    }
+
+    // Parse allowed_folders
+    size_t afPos = configContent.find("\"allowed_folders\"");
+    if (afPos != std::string::npos) {
+        size_t arrStart = configContent.find('[', afPos);
+        size_t arrEnd = configContent.find(']', arrStart);
+        if (arrStart != std::string::npos && arrEnd != std::string::npos) {
+            std::string arrStr = configContent.substr(arrStart, arrEnd - arrStart + 1);
+            size_t strPos = 0;
+            while ((strPos = arrStr.find('\"', strPos)) != std::string::npos) {
+                size_t end = arrStr.find('\"', strPos + 1);
+                if (end == std::string::npos) break;
+                std::string folder = arrStr.substr(strPos + 1, end - strPos - 1);
+                if (!folder.empty()) {
+                    outConfig.allowedFolders.push_back(folder);
+                }
+                strPos = end + 1;
+            }
+        }
+    }
+
     return true;
 }
 

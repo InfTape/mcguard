@@ -286,6 +286,11 @@ int main(int argc, char* argv[]) {
         view.PrintStatus("Loaded " + info);
     }
 
+    for (const auto& folder : cfg.allowedFolders) {
+        correlator.AddAllowedFolder(util::Utf8ToWide(folder), "Custom Allowed Folder");
+        view.PrintStatus("Loaded Allowed Folder: " + folder);
+    }
+
     // Configure DnsTracker with domain suffixes and dynamic WFP whitelisting callback
     auto& dnsTracker = core::DnsTracker::Instance();
     if (hasConfig && !cfg.allowedDomainSuffixes.empty()) {
@@ -355,6 +360,24 @@ int main(int argc, char* argv[]) {
             if (!mc.version.empty()) {
                 view.PrintStatus("Version: " + util::WideToUtf8(mc.version));
             }
+            if (!mc.gameDir.empty()) {
+                view.PrintSuccess("Whitelisted Game Directory: " + util::WideToUtf8(mc.gameDir));
+                correlator.AddAllowedFolder(mc.gameDir, "Minecraft Game Dir");
+            }
+            if (!mc.javaHome.empty()) {
+                correlator.AddAllowedFolder(mc.javaHome, "Java Runtime");
+            }
+
+            // Post Process Start event to Audit Log (matches Procmon)
+            core::AuditRecord startRec;
+            startRec.timestamp = util::GetCurrentTimeString();
+            startRec.pid = mc.pid;
+            startRec.type = "PROC_START";
+            startRec.target = util::WideToUtf8(mc.exePath);
+            startRec.action = core::AuditAction::AUDIT;
+            startRec.source = "Process Start";
+            startRec.details = "Parent PID: " + std::to_string(mc.parentPid) + ", Command line: " + util::WideToUtf8(mc.commandLine);
+            correlator.PostAuditRecord(startRec);
 
             {
                 std::lock_guard<std::mutex> lock(pidListMutex);

@@ -6,15 +6,92 @@
 namespace mcguard {
 namespace core {
 
+static std::wstring NormalizeFolderPath(const std::wstring& raw) {
+    std::wstring p = raw;
+    for (auto& c : p) {
+        if (c == L'/') c = L'\\';
+        c = (wchar_t)towlower(c);
+    }
+    while (p.length() > 3 && p.back() == L'\\') {
+        p.pop_back();
+    }
+    return p;
+}
+
 Correlator::Correlator() {
     m_sensitivePatterns = {
         ".ssh", "id_rsa", "id_ed25519", "servers.dat", "launcher_profiles.json",
         "Cookies", "Login Data", "Local State", "tokens.json", "Discord",
         "Chrome\\User Data", "Edge\\User Data"
     };
+
+    // Standard Windows runtime folders in whitelist
+    wchar_t winDir[MAX_PATH] = { 0 };
+    if (GetWindowsDirectoryW(winDir, MAX_PATH)) {
+        AddAllowedFolder(winDir, "Windows System");
+    }
+    wchar_t progFiles[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableW(L"ProgramFiles", progFiles, MAX_PATH)) {
+        AddAllowedFolder(progFiles, "Program Files");
+    }
+    wchar_t progFilesX86[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableW(L"ProgramFiles(x86)", progFilesX86, MAX_PATH)) {
+        AddAllowedFolder(progFilesX86, "Program Files (x86)");
+    }
+    wchar_t tempDir[MAX_PATH] = { 0 };
+    if (GetTempPathW(MAX_PATH, tempDir)) {
+        AddAllowedFolder(tempDir, "Temp / Native Cache");
+    }
 }
 
 Correlator::~Correlator() {}
+
+void Correlator::SetFolderWhitelistEnforced(bool enforced) {
+    m_enforceFolderWhitelist = enforced;
+}
+
+void Correlator::ClearAllowedFolders() {
+    std::lock_guard<std::mutex> lock(m_folderMutex);
+    m_folderWhitelist.clear();
+}
+
+void Correlator::AddAllowedFolder(const std::wstring& folderPath, const std::string& description) {
+    if (folderPath.empty()) return;
+    std::wstring norm = NormalizeFolderPath(folderPath);
+
+    std::lock_guard<std::mutex> lock(m_folderMutex);
+    for (const auto& entry : m_folderWhitelist) {
+        if (entry.normalizedPrefix == norm) return;
+    }
+    m_folderWhitelist.push_back({ norm, description.empty() ? "Allowed Folder" : description });
+}
+
+bool Correlator::IsPathInFolderWhitelist(const std::wstring& filePath, std::string& outCategory) {
+    if (filePath.empty()) return true;
+
+    // Special handles or device paths
+    if (filePath.find(L"[Unknown") != std::wstring::npos) {
+        outCategory = "Win32 Handle";
+        return true;
+    }
+
+    std::wstring normFile = NormalizeFolderPath(filePath);
+
+    std::lock_guard<std::mutex> lock(m_folderMutex);
+    for (const auto& entry : m_folderWhitelist) {
+        if (entry.normalizedPrefix.empty()) continue;
+
+        if (normFile.rfind(entry.normalizedPrefix, 0) == 0) {
+            // Check boundary: exact match or followed by backslash
+            if (normFile.length() == entry.normalizedPrefix.length() ||
+                normFile[entry.normalizedPrefix.length()] == L'\\') {
+                outCategory = entry.description;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 void Correlator::SetSensitivePatterns(const std::vector<std::string>& patterns) {
     m_sensitivePatterns = patterns;
@@ -138,32 +215,37 @@ void Correlator::OnEtwEvent(const EtwEvent& ev) {
         }
 
         case EtwEventType::FILE_CREATE:
-            record.type = "FILE_CREATE";
-            record.isSensitive = IsSensitiveFile(targetUtf8);
-            record.source = ClassifyFileSource(targetUtf8);
-            record.action = record.isSensitive ? AuditAction::ALERT : AuditAction::AUDIT;
-            break;
-
         case EtwEventType::FILE_READ:
-            record.type = "FILE_READ";
-            record.isSensitive = IsSensitiveFile(targetUtf8);
-            record.source = ClassifyFileSource(targetUtf8);
-            record.action = record.isSensitive ? AuditAction::ALERT : AuditAction::AUDIT;
-            break;
-
         case EtwEventType::FILE_WRITE:
-            record.type = "FILE_WRITE";
-            record.isSensitive = IsSensitiveFile(targetUtf8);
-            record.source = ClassifyFileSource(targetUtf8);
-            record.action = record.isSensitive ? AuditAction::ALERT : AuditAction::AUDIT;
-            break;
+        case EtwEventType::FILE_DELETE: {
+            if (ev.type == EtwEventType::FILE_CREATE) record.type = "FILE_CREATE";
+            else if (ev.type == EtwEventType::FILE_READ) record.type = "FILE_READ";
+            else if (ev.type == EtwEventType::FILE_WRITE) record.type = "FILE_WRITE";
+            else record.type = "FILE_DELETE";
 
-        case EtwEventType::FILE_DELETE:
-            record.type = "FILE_DELETE";
-            record.isSensitive = IsSensitiveFile(targetUtf8);
-            record.source = ClassifyFileSource(targetUtf8);
-            record.action = record.isSensitive ? AuditAction::ALERT : AuditAction::AUDIT;
+            bool isSens = IsSensitiveFile(targetUtf8);
+            record.isSensitive = isSens;
+
+            std::string folderDesc;
+            bool inFolderWhitelist = IsPathInFolderWhitelist(ev.target, folderDesc);
+
+            if (isSens) {
+                record.action = AuditAction::ALERT;
+                record.source = "Suspicious File Access (Sensitive)";
+            } else if (inFolderWhitelist || !m_enforceFolderWhitelist) {
+                record.action = AuditAction::AUDIT;
+                record.source = ClassifyFileSource(targetUtf8);
+                if (record.source == "Win32/JNI I/O" && !folderDesc.empty()) {
+                    record.source = folderDesc;
+                }
+            } else {
+                record.action = AuditAction::ALERT;
+                record.source = "Out-of-Bounds File Access";
+                record.isSensitive = true;
+                record.details = "Accessed file outside whitelisted folders";
+            }
             break;
+        }
 
         default:
             record.type = "I/O";

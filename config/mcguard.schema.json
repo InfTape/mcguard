@@ -66,6 +66,17 @@
         "highlight_sensitive": {
           "type": "boolean"
         },
+        "auto_whitelist_game_dir": {
+          "type": "boolean",
+          "description": "Automatically detect and whitelist Minecraft game directory from Process Start"
+        },
+        "allowed_folders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Explicit list of allowed folders for Minecraft I/O"
+        },
         "sensitive_patterns": {
           "type": "array",
           "items": {

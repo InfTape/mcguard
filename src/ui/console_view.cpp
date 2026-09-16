@@ -155,14 +155,16 @@ void ConsoleView::DisplayRecord(const core::AuditRecord& record) {
         typeColor = m_ansiSupported ? ANSI_CYAN : "";
     } else if (record.type.find("READ") != std::string::npos) {
         typeColor = m_ansiSupported ? ANSI_YELLOW : "";
-    } else if (record.type.find("WRITE") != std::string::npos || record.type.find("CREATE") != std::string::npos) {
+    } else if (record.type.find("WRITE") != std::string::npos || record.type.find("CREATE") != std::string::npos || record.type.find("DELETE") != std::string::npos) {
         typeColor = m_ansiSupported ? ANSI_MAGENTA : "";
+    } else if (record.type.find("PROCESS") != std::string::npos) {
+        typeColor = m_ansiSupported ? ANSI_CYAN ANSI_BOLD : "";
     }
 
     std::string sourceColor = "";
-    if (record.source.find("Native") != std::string::npos) {
-        sourceColor = m_ansiSupported ? ANSI_RED : "";
-    } else if (record.source.find("Minecraft") != std::string::npos) {
+    if (record.source.find("Native") != std::string::npos || record.source.find("Out-of-Bounds") != std::string::npos || record.source.find("Suspicious") != std::string::npos) {
+        sourceColor = m_ansiSupported ? ANSI_RED ANSI_BOLD : "";
+    } else if (record.source.find("Minecraft") != std::string::npos || record.source.find("Process Start") != std::string::npos) {
         sourceColor = m_ansiSupported ? ANSI_GREEN : "";
     } else {
         sourceColor = m_ansiSupported ? ANSI_YELLOW : "";

@@ -57,12 +57,26 @@ public:
     bool IsTargetWhitelisted(const std::string& target);
     bool IsSensitiveFile(const std::string& path);
 
+    // Folder whitelist API
+    void SetFolderWhitelistEnforced(bool enforced);
+    void AddAllowedFolder(const std::wstring& folderPath, const std::string& description = "Allowed Folder");
+    void ClearAllowedFolders();
+    bool IsPathInFolderWhitelist(const std::wstring& filePath, std::string& outCategory);
+
 private:
     std::string ClassifyFileSource(const std::string& path);
 
+    struct FolderWhitelistEntry {
+        std::wstring normalizedPrefix;
+        std::string description;
+    };
+
     std::vector<std::string> m_sensitivePatterns;
     std::vector<WhitelistRule> m_whitelist;
+    std::vector<FolderWhitelistEntry> m_folderWhitelist;
     std::mutex m_rulesMutex;
+    std::mutex m_folderMutex;
+    bool m_enforceFolderWhitelist = true;
     AuditCallback m_callback;
 };
 

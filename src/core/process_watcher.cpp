@@ -82,6 +82,23 @@ bool ProcessWatcher::InspectProcess(DWORD pid, MinecraftProcessInfo& outInfo) {
     outInfo.exePath = exeStr;
     outInfo.commandLine = cmdLine;
 
+    // Derive javaHome from exeStr (e.g. C:\...\java\bin\java.exe -> C:\...\java)
+    size_t lastSlash = exeStr.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        std::wstring binDir = exeStr.substr(0, lastSlash);
+        size_t prevSlash = binDir.find_last_of(L"\\/");
+        if (prevSlash != std::wstring::npos) {
+            std::wstring folderName = binDir.substr(prevSlash + 1);
+            if (util::EqualsIgnoreCase(folderName, L"bin")) {
+                outInfo.javaHome = binDir.substr(0, prevSlash);
+            } else {
+                outInfo.javaHome = binDir;
+            }
+        } else {
+            outInfo.javaHome = binDir;
+        }
+    }
+
     // Detect if this Java process is Minecraft
     bool hasMcMain = util::ContainsIgnoreCase(cmdLine, L"net.minecraft.client.main.Main") ||
                      util::ContainsIgnoreCase(cmdLine, L"net.minecraft.launchwrapper.Launch") ||
@@ -95,10 +112,11 @@ bool ProcessWatcher::InspectProcess(DWORD pid, MinecraftProcessInfo& outInfo) {
 
     outInfo.isMinecraft = hasMcMain || hasMcArgs;
 
-    // Parse gameDir if present
-    size_t gameDirPos = cmdLine.find(L"--gameDir ");
+    // 1. Parse --gameDir if present
+    size_t gameDirPos = cmdLine.find(L"--gameDir");
     if (gameDirPos != std::wstring::npos) {
-        size_t start = gameDirPos + 10;
+        size_t start = gameDirPos + 9;
+        while (start < cmdLine.size() && (cmdLine[start] == L' ' || cmdLine[start] == L'=')) start++;
         if (start < cmdLine.size()) {
             if (cmdLine[start] == L'\"') {
                 size_t end = cmdLine.find(L'\"', start + 1);
@@ -112,13 +130,74 @@ bool ProcessWatcher::InspectProcess(DWORD pid, MinecraftProcessInfo& outInfo) {
         }
     }
 
+    // 2. If empty, check for -Dminecraft.client.jar= or -Djava.library.path= or -Djna.tmpdir=
+    if (outInfo.gameDir.empty()) {
+        const std::wstring keys[] = {
+            L"-Dminecraft.client.jar=",
+            L"-Djava.library.path=",
+            L"-Djna.tmpdir=",
+            L"-Dio.netty.native.workdir="
+        };
+        for (const auto& key : keys) {
+            size_t pos = cmdLine.find(key);
+            if (pos != std::wstring::npos) {
+                size_t start = pos + key.length();
+                if (start < cmdLine.size() && cmdLine[start] == L'\"') start++;
+                size_t end = cmdLine.find_first_of(L"\" \t\r\n", start);
+                std::wstring val = cmdLine.substr(start, end == std::wstring::npos ? end : end - start);
+
+                // Find .minecraft in this path
+                size_t mcPos = val.find(L".minecraft");
+                if (mcPos != std::wstring::npos) {
+                    outInfo.gameDir = val.substr(0, mcPos + 10);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. If still empty, search for any token containing ".minecraft"
+    if (outInfo.gameDir.empty()) {
+        size_t mcPos = cmdLine.find(L".minecraft");
+        if (mcPos != std::wstring::npos) {
+            size_t tokenStart = cmdLine.rfind(L" ", mcPos);
+            tokenStart = (tokenStart == std::wstring::npos) ? 0 : tokenStart + 1;
+            if (tokenStart < cmdLine.size() && cmdLine[tokenStart] == L'\"') tokenStart++;
+            outInfo.gameDir = cmdLine.substr(tokenStart, (mcPos + 10) - tokenStart);
+        }
+    }
+
+    // 4. Default fallback: %APPDATA%\.minecraft
+    if (outInfo.gameDir.empty()) {
+        wchar_t appData[MAX_PATH] = { 0 };
+        if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) {
+            outInfo.gameDir = std::wstring(appData) + L"\\.minecraft";
+        }
+    }
+
+    // Clean and normalize outInfo.gameDir
+    while (!outInfo.gameDir.empty() && (outInfo.gameDir.back() == L'\\' || outInfo.gameDir.back() == L'/' || outInfo.gameDir.back() == L'\"')) {
+        outInfo.gameDir.pop_back();
+    }
+    while (!outInfo.gameDir.empty() && (outInfo.gameDir.front() == L'\"')) {
+        outInfo.gameDir.erase(outInfo.gameDir.begin());
+    }
+
     // Parse version if present
-    size_t verPos = cmdLine.find(L"--version ");
+    size_t verPos = cmdLine.find(L"--version");
     if (verPos != std::wstring::npos) {
-        size_t start = verPos + 10;
+        size_t start = verPos + 9;
+        while (start < cmdLine.size() && (cmdLine[start] == L' ' || cmdLine[start] == L'=')) start++;
         if (start < cmdLine.size()) {
-            size_t end = cmdLine.find(L' ', start);
-            outInfo.version = cmdLine.substr(start, end == std::wstring::npos ? end : end - start);
+            if (cmdLine[start] == L'\"') {
+                size_t end = cmdLine.find(L'\"', start + 1);
+                if (end != std::wstring::npos) {
+                    outInfo.version = cmdLine.substr(start + 1, end - start - 1);
+                }
+            } else {
+                size_t end = cmdLine.find(L' ', start);
+                outInfo.version = cmdLine.substr(start, end == std::wstring::npos ? end : end - start);
+            }
         }
     }
 
@@ -139,7 +218,9 @@ std::vector<MinecraftProcessInfo> ProcessWatcher::FindMinecraftProcesses() {
             std::wstring procName(pe.szExeFile);
             if (util::EqualsIgnoreCase(procName, L"javaw.exe") || util::EqualsIgnoreCase(procName, L"java.exe")) {
                 MinecraftProcessInfo info;
+                info.parentPid = pe.th32ParentProcessID;
                 if (InspectProcess(pe.th32ProcessID, info) && info.isMinecraft) {
+                    info.parentPid = pe.th32ParentProcessID;
                     results.push_back(info);
                 }
             }
