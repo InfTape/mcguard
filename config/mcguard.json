@@ -10,8 +10,7 @@
       "minecraft.net",
       "minecraftservices.com",
       "minecraft-services.net",
-      "3c3u.org",
-      "3c3u.icu"
+      "3c3u.org"
     ],
     "whitelist": [
       {
@@ -21,17 +20,10 @@
         "protocol": "TCP"
       },
       {
-        "description": "3c3u Minecraft Server (Main)",
+        "description": "3c3u Minecraft Server",
         "host": "3c3u.org",
         "ip": "202.189.7.174",
         "port": 25565,
-        "protocol": "TCP"
-      },
-      {
-        "description": "3c3u Minecraft Server (Node / Proxy)",
-        "host": "3c3u.icu",
-        "ip": "180.188.24.125",
-        "port": 37900,
         "protocol": "TCP"
       }
     ]
