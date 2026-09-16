@@ -297,6 +297,33 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         }
     }
 
+    // Parse sandbox settings
+    size_t sbPos = configContent.find("\"sandbox\"");
+    if (sbPos != std::string::npos) {
+        size_t objStart = configContent.find('{', sbPos);
+        size_t objEnd = configContent.find('}', objStart);
+        if (objStart != std::string::npos && objEnd != std::string::npos) {
+            std::string sbStr = configContent.substr(objStart, objEnd - objStart + 1);
+            std::string en = FindJsonFieldValue(sbStr, "enabled");
+            if (!en.empty()) outConfig.sandbox.enabled = (en == "true");
+
+            std::string bcp = FindJsonFieldValue(sbStr, "block_child_processes");
+            if (!bcp.empty()) outConfig.sandbox.blockChildProcesses = (bcp == "true");
+
+            std::string li = FindJsonFieldValue(sbStr, "low_integrity");
+            if (!li.empty()) outConfig.sandbox.lowIntegrity = (li == "true");
+
+            std::string sp = FindJsonFieldValue(sbStr, "strip_privileges");
+            if (!sp.empty()) outConfig.sandbox.stripPrivileges = (sp == "true");
+
+            std::string ujo = FindJsonFieldValue(sbStr, "use_job_object");
+            if (!ujo.empty()) outConfig.sandbox.useJobObject = (ujo == "true");
+
+            std::string rjp = FindJsonFieldValue(sbStr, "real_java_path");
+            if (!rjp.empty()) outConfig.sandbox.realJavaPath = rjp;
+        }
+    }
+
     return true;
 }
 

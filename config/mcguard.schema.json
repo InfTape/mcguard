@@ -102,6 +102,17 @@
           "type": "boolean"
         }
       }
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "block_child_processes": { "type": "boolean" },
+        "low_integrity": { "type": "boolean" },
+        "strip_privileges": { "type": "boolean" },
+        "use_job_object": { "type": "boolean" },
+        "real_java_path": { "type": "string" }
+      }
     }
   },
   "required": ["network"]

@@ -28,6 +28,7 @@ cl.exe /std:c++17 /EHsc /O2 /W3 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 ^
     "%~dp0src\util\config_loader.cpp" ^
     "%~dp0src\core\process_watcher.cpp" ^
     "%~dp0src\core\wfp_guard.cpp" ^
+    "%~dp0src\core\sandbox_launcher.cpp" ^
     "%~dp0src\core\etw_watcher.cpp" ^
     "%~dp0src\core\network_tracker.cpp" ^
     "%~dp0src\core\folder_watcher.cpp" ^
@@ -35,7 +36,7 @@ cl.exe /std:c++17 /EHsc /O2 /W3 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 ^
     "%~dp0src\core\correlator.cpp" ^
     "%~dp0src\core\dns_tracker.cpp" ^
     "%~dp0src\ui\console_view.cpp" ^
-    /link /MANIFEST:EMBED /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'" ^
+    /link /MANIFEST:EMBED /MANIFESTUAC:"level='asInvoker' uiAccess='false'" ^
     Fwpuclnt.lib Advapi32.lib tdh.lib Ws2_32.lib Iphlpapi.lib Shell32.lib Ole32.lib User32.lib ^
     /out:"%~dp0MCGuard.exe"
 

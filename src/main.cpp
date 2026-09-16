@@ -10,6 +10,7 @@
 #include "util/config_loader.h"
 #include "core/process_watcher.h"
 #include "core/wfp_guard.h"
+#include "core/sandbox_launcher.h"
 #include "core/etw_watcher.h"
 #include "core/network_tracker.h"
 #include "core/folder_watcher.h"
@@ -41,11 +42,13 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
 }
 
 void PrintUsage() {
-    std::cout << "MCGuard v1.0 - Standalone Pure User-Mode Minecraft Sandbox Auditor\n"
-              << "Zero-configuration, no Java Agent or JVM arguments required.\n\n"
+    std::cout << "MCGuard v1.1 - Standalone Pure User-Mode Minecraft Sandbox & Security Auditor\n"
+              << "Zero-configuration, no Java Agent or kernel drivers required.\n\n"
               << "Usage: MCGuard.exe <command> [options]\n\n"
               << "Commands:\n"
               << "  watch              Auto-discover Minecraft (javaw.exe) and attach WFP + ETW + Module Audit\n"
+              << "  run -- <exe> [args] Launch target inside Windows Kernel Restricted Sandbox (Low Integrity + Block Child Proc)\n"
+              << "  sandbox [args]     Alias for 'run'\n"
               << "  test-wfp           Test WFP ALE dynamic engine and rule installation\n"
               << "  demo               Run live demonstration of WFP blocking and native I/O audit\n\n"
               << "Options:\n"
@@ -91,33 +94,68 @@ int main(int argc, char* argv[]) {
     whitelist.push_back(rDns);
 
     bool requestElevate = false;
+    std::string targetExe;
+    std::string targetCmdLine;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--help" || arg == "-h") {
-            PrintUsage();
-            return 0;
-        } else if (arg == "--elevate") {
-            requestElevate = true;
-        } else if (arg == "--whitelist" && i + 1 < argc) {
-            std::string wp = argv[++i];
-            size_t colon = wp.find(':');
-            core::WhitelistRule r;
-            r.protocol = "TCP";
-            std::string hostOrIp;
-            if (colon != std::string::npos) {
-                hostOrIp = wp.substr(0, colon);
-                r.port = (uint16_t)std::stoi(wp.substr(colon + 1));
+    // Check if launched as a direct Java wrapper (e.g. HMCL called MCGuard with JVM args: -Xmx... or -D...)
+    if (argc > 1 && argv[1][0] == '-' && (std::string(argv[1]).rfind("-X", 0) == 0 || std::string(argv[1]).rfind("-D", 0) == 0)) {
+        command = "sandbox";
+        targetExe = cfg.sandbox.realJavaPath.empty() ? "java.exe" : cfg.sandbox.realJavaPath;
+        targetCmdLine = "\"" + targetExe + "\" ";
+        for (int k = 1; k < argc; ++k) {
+            std::string a = argv[k];
+            if (a.find(' ') != std::string::npos) {
+                targetCmdLine += "\"" + a + "\" ";
             } else {
-                hostOrIp = wp;
-                r.port = 25565;
+                targetCmdLine += a + " ";
             }
-            // Automatically resolve domain name to IP if host provided
-            r.ip = util::ConfigLoader::ResolveHostToIp(hostOrIp);
-            r.description = "User Whitelist (" + hostOrIp + (r.ip != hostOrIp ? " -> " + r.ip : "") + ")";
-            whitelist.push_back(r);
-        } else if (arg[0] != '-') {
-            command = arg;
+        }
+    } else {
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                PrintUsage();
+                return 0;
+            } else if (arg == "--elevate") {
+                requestElevate = true;
+            } else if (arg == "run" || arg == "sandbox") {
+                command = "sandbox";
+                int targetIdx = i + 1;
+                if (targetIdx < argc && std::string(argv[targetIdx]) == "--") {
+                    targetIdx++;
+                }
+                if (targetIdx < argc) {
+                    targetExe = argv[targetIdx];
+                    for (int k = targetIdx; k < argc; ++k) {
+                        std::string a = argv[k];
+                        if (a.find(' ') != std::string::npos) {
+                            targetCmdLine += "\"" + a + "\" ";
+                        } else {
+                            targetCmdLine += a + " ";
+                        }
+                    }
+                }
+                break;
+            } else if (arg == "--whitelist" && i + 1 < argc) {
+                std::string wp = argv[++i];
+                size_t colon = wp.find(':');
+                core::WhitelistRule r;
+                r.protocol = "TCP";
+                std::string hostOrIp;
+                if (colon != std::string::npos) {
+                    hostOrIp = wp.substr(0, colon);
+                    r.port = (uint16_t)std::stoi(wp.substr(colon + 1));
+                } else {
+                    hostOrIp = wp;
+                    r.port = 25565;
+                }
+                // Automatically resolve domain name to IP if host provided
+                r.ip = util::ConfigLoader::ResolveHostToIp(hostOrIp);
+                r.description = "User Whitelist (" + hostOrIp + (r.ip != hostOrIp ? " -> " + r.ip : "") + ")";
+                whitelist.push_back(r);
+            } else if (arg[0] != '-') {
+                command = arg;
+            }
         }
     }
 
@@ -253,6 +291,155 @@ int main(int argc, char* argv[]) {
         correlator.PostAuditRecord(r5);
 
         std::cout << "\n[+] Demonstration completed. Audit records recorded to mcguard_audit.jsonl.\n";
+        return 0;
+    }
+
+    // Command: sandbox / run
+    if (command == "sandbox") {
+        view.Initialize();
+        view.PrintStatus("Initializing MCGuard Kernel Restricted Sandbox...");
+
+        if (targetExe.empty()) {
+            view.PrintError("No target executable specified to run in sandbox.");
+            view.PrintStatus("Usage: MCGuard.exe run -- <path_to_java.exe> [arguments...]");
+            return 1;
+        }
+
+        std::wstring wTargetExe = util::Utf8ToWide(targetExe);
+        std::wstring wCmdLine = util::Utf8ToWide(targetCmdLine);
+
+        // 1. Detect gameDir from command line
+        std::wstring gameDir;
+        size_t gameDirPos = wCmdLine.find(L"--gameDir");
+        if (gameDirPos != std::wstring::npos) {
+            size_t start = gameDirPos + 9;
+            while (start < wCmdLine.size() && (wCmdLine[start] == L' ' || wCmdLine[start] == L'=')) start++;
+            if (start < wCmdLine.size()) {
+                if (wCmdLine[start] == L'\"') {
+                    size_t end = wCmdLine.find(L'\"', start + 1);
+                    if (end != std::wstring::npos) gameDir = wCmdLine.substr(start + 1, end - start - 1);
+                } else {
+                    size_t end = wCmdLine.find(L' ', start);
+                    gameDir = wCmdLine.substr(start, end == std::wstring::npos ? end : end - start);
+                }
+            }
+        }
+        if (gameDir.empty()) {
+            size_t mcPos = wCmdLine.find(L".minecraft");
+            if (mcPos != std::wstring::npos) {
+                size_t start = wCmdLine.rfind(L'\"', mcPos);
+                if (start == std::wstring::npos) start = wCmdLine.rfind(L' ', mcPos);
+                start = (start == std::wstring::npos) ? 0 : start + 1;
+                gameDir = wCmdLine.substr(start, (mcPos + 10) - start);
+            }
+        }
+
+        if (!gameDir.empty()) {
+            view.PrintStatus("Target Game Directory: " + util::WideToUtf8(gameDir));
+        }
+
+        // 2. Prepare Sandbox Options
+        core::SandboxOptions sbOptions;
+        sbOptions.blockChildProcesses = cfg.sandbox.blockChildProcesses;
+        sbOptions.lowIntegrity = cfg.sandbox.lowIntegrity;
+        sbOptions.stripPrivileges = cfg.sandbox.stripPrivileges;
+        sbOptions.useJobObject = cfg.sandbox.useJobObject;
+        sbOptions.startSuspended = true;
+        sbOptions.gameDir = gameDir;
+
+        // 3. Initialize WFP ALE engine
+        core::WfpGuard wfp;
+        g_pWfp = &wfp;
+        if (isElevated) {
+            wfp.Initialize();
+        }
+
+        // 4. Launch in suspended state
+        core::SandboxProcessInfo procInfo;
+        std::string launchErr;
+        bool launched = core::SandboxLauncher::LaunchSandboxedProcess(
+            wTargetExe, wCmdLine, sbOptions, procInfo, launchErr
+        );
+
+        if (!launched) {
+            view.PrintError("Sandbox launch failed: " + launchErr);
+            return 1;
+        }
+
+        view.PrintSuccess("Process created inside Sandbox (PID: " + std::to_string(procInfo.processId) + ")");
+        if (sbOptions.lowIntegrity) {
+            view.PrintStatus("Integrity Level: LOW (S-1-16-4096) - Write access denied to system/user folders");
+        }
+        if (sbOptions.blockChildProcesses) {
+            view.PrintStatus("Child Process Policy: RESTRICTED - Kernel forbids cmd.exe/powershell creation");
+        }
+        if (sbOptions.useJobObject) {
+            view.PrintStatus("Job Object Limit: ActiveProcessLimit = 1 (Breakout blocked)");
+        }
+
+        // 5. Pre-flight arm WFP firewall before any instruction executes
+        if (isElevated && wfp.IsActive()) {
+            if (wfp.ProtectApplication(wTargetExe, whitelist)) {
+                view.PrintSuccess("WFP Firewall rules armed before first CPU instruction!");
+            }
+        }
+
+        // 6. Setup Correlator & Handlers
+        core::Correlator correlator;
+        correlator.SetWhitelistRules(whitelist);
+        correlator.SetSensitivePatterns(cfg.sensitivePatterns);
+        if (!gameDir.empty()) {
+            correlator.AddAllowedFolder(gameDir, "Minecraft Game Dir");
+        }
+        correlator.SetAuditCallback([&view](const core::AuditRecord& rec) {
+            view.DisplayRecord(rec);
+        });
+
+        // 7. Resume sandboxed process thread
+        core::SandboxLauncher::ResumeSandboxedProcess(procInfo);
+        view.PrintSuccess("Sandboxed Minecraft is now running safely!\n");
+
+        // 8. Start ETW & Network tracking
+        core::EtwWatcher etw;
+        g_pEtw = &etw;
+        if (isElevated) {
+            etw.Start([&correlator](const core::EtwEvent& ev) {
+                correlator.OnEtwEvent(ev);
+            });
+            etw.AddTargetPid(procInfo.processId);
+        }
+
+        core::NetworkTracker netTracker;
+        g_pNetTracker = &netTracker;
+        netTracker.StartPolling([&correlator](DWORD pid, const std::string& remoteIp, uint16_t remotePort, bool isNew) {
+            correlator.OnNetworkConnection(pid, remoteIp, remotePort);
+        }, 500);
+        netTracker.AddMonitoredPid(procInfo.processId);
+
+        core::ModuleTracker modTracker;
+
+        // Loop until process exits or user exits
+        while (!g_exitRequested) {
+            DWORD waitRes = WaitForSingleObject(procInfo.hProcess, 500);
+            if (waitRes == WAIT_OBJECT_0) {
+                DWORD exitCode = 0;
+                GetExitCodeProcess(procInfo.hProcess, &exitCode);
+                view.PrintStatus("Sandboxed process exited with code " + std::to_string(exitCode));
+                break;
+            }
+
+            // Periodically check for new loaded modules
+            modTracker.CheckForNewModules(procInfo.processId, [&correlator](DWORD pid, const core::LoadedModuleInfo& mod) {
+                correlator.OnModuleLoaded(pid, mod);
+            });
+        }
+
+        netTracker.StopPolling();
+        if (isElevated) etw.Stop();
+        wfp.Detach();
+        wfp.Shutdown();
+        core::SandboxLauncher::CleanupProcessInfo(procInfo);
+        view.PrintSuccess("MCGuard Sandbox session ended cleanly.");
         return 0;
     }
 

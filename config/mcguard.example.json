@@ -67,5 +67,13 @@
     "jsonl_output": "mcguard_audit.jsonl",
     "console_output": true,
     "verbose": false
+  },
+  "sandbox": {
+    "enabled": true,
+    "block_child_processes": true,
+    "low_integrity": true,
+    "strip_privileges": true,
+    "use_job_object": true,
+    "real_java_path": ""
   }
 }

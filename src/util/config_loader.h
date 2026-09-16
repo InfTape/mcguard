@@ -7,6 +7,15 @@
 namespace mcguard {
 namespace util {
 
+struct SandboxConfig {
+    bool enabled = true;
+    bool blockChildProcesses = true;
+    bool lowIntegrity = true;
+    bool stripPrivileges = true;
+    bool useJobObject = true;
+    std::string realJavaPath;
+};
+
 struct ConfigData {
     std::vector<core::WhitelistRule> whitelist;
     std::vector<std::string> sensitivePatterns;
@@ -16,6 +25,7 @@ struct ConfigData {
     bool allowLan = true;
     bool allowDns = true;
     bool autoWhitelistGameDir = true;
+    SandboxConfig sandbox;
 };
 
 class ConfigLoader {
