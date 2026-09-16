@@ -196,15 +196,18 @@ int main(int argc, char* argv[]) {
 
     // If launched headlessly or hidden by a launcher (such as HMCL or PCL), ensure monitoring console window is visible
     HWND hConsole = GetConsoleWindow();
-    if (hConsole == NULL) {
-        AllocConsole();
-        hConsole = GetConsoleWindow();
-        FILE* fpOut = nullptr;
-        FILE* fpErr = nullptr;
-        FILE* fpIn = nullptr;
-        freopen_s(&fpOut, "CONOUT$", "w", stdout);
-        freopen_s(&fpErr, "CONOUT$", "w", stderr);
-        freopen_s(&fpIn, "CONIN$", "r", stdin);
+    if (hConsole == NULL || !IsWindowVisible(hConsole)) {
+        FreeConsole();
+        if (AllocConsole()) {
+            hConsole = GetConsoleWindow();
+            FILE* fpOut = nullptr;
+            FILE* fpErr = nullptr;
+            FILE* fpIn = nullptr;
+            freopen_s(&fpOut, "CONOUT$", "w", stdout);
+            freopen_s(&fpErr, "CONOUT$", "w", stderr);
+            freopen_s(&fpIn, "CONIN$", "r", stdin);
+            std::ios::sync_with_stdio(true);
+        }
     }
     if (hConsole != NULL) {
         ShowWindow(hConsole, SW_SHOW);
