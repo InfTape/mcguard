@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MCGuard Configuration",
+  "description": "Configuration schema for MCGuard standalone Minecraft security auditor",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "network": {
+      "type": "object",
+      "properties": {
+        "default_policy": {
+          "type": "string",
+          "enum": ["BLOCK", "ALLOW"]
+        },
+        "allow_localhost": {
+          "type": "boolean"
+        },
+        "allow_dns": {
+          "type": "boolean"
+        },
+        "allowed_domain_suffixes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "whitelist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "host": {
+                "type": "string"
+              },
+              "ip": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer"
+              },
+              "protocol": {
+                "type": "string",
+                "enum": ["TCP", "UDP", "ANY"]
+              }
+            },
+            "required": ["port"]
+          }
+        }
+      },
+      "required": ["default_policy", "whitelist"]
+    },
+    "file_audit": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "highlight_sensitive": {
+          "type": "boolean"
+        },
+        "sensitive_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "jsonl_output": {
+          "type": "string"
+        },
+        "console_output": {
+          "type": "boolean"
+        },
+        "verbose": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "required": ["network"]
+}

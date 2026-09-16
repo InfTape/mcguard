@@ -1,0 +1,51 @@
+{
+  "$schema": "./mcguard.schema.json",
+  "version": "1.0.0",
+  "network": {
+    "default_policy": "BLOCK",
+    "allow_localhost": true,
+    "allow_dns": true,
+    "allowed_domain_suffixes": [
+      "mojang.com",
+      "minecraft.net",
+      "minecraftservices.com",
+      "minecraft-services.net",
+      "3c3u.org"
+    ],
+    "whitelist": [
+      {
+        "description": "Default Minecraft Local Server",
+        "ip": "127.0.0.1",
+        "port": 25565,
+        "protocol": "TCP"
+      },
+      {
+        "description": "3c3u Minecraft Server",
+        "host": "3c3u.org",
+        "ip": "202.189.7.174",
+        "port": 25565,
+        "protocol": "TCP"
+      }
+    ]
+  },
+  "file_audit": {
+    "enabled": true,
+    "highlight_sensitive": true,
+    "sensitive_patterns": [
+      ".ssh",
+      "id_rsa",
+      "launcher_profiles.json",
+      "servers.dat",
+      "usercache.json",
+      "Cookies",
+      "Login Data",
+      "Local State",
+      "tokens.json"
+    ]
+  },
+  "logging": {
+    "jsonl_output": "mcguard_audit.jsonl",
+    "console_output": true,
+    "verbose": false
+  }
+}
