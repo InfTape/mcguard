@@ -47,6 +47,11 @@ void DnsTracker::AddAllowedDomainSuffix(const std::string& suffix) {
     m_allowedSuffixes.push_back(s);
 }
 
+void DnsTracker::ClearAllowedDomainSuffixes() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_allowedSuffixes.clear();
+}
+
 bool DnsTracker::IsDomainWhitelisted(const std::string& domain) const {
     if (domain.empty()) return false;
     std::string lowerDomain = ToLowerString(domain);

@@ -275,15 +275,12 @@ int main(int argc, char* argv[]) {
 
     // Configure DnsTracker with domain suffixes and dynamic WFP whitelisting callback
     auto& dnsTracker = core::DnsTracker::Instance();
-    if (hasConfig) {
+    if (hasConfig && !cfg.allowedDomainSuffixes.empty()) {
+        dnsTracker.ClearAllowedDomainSuffixes();
         for (const auto& suffix : cfg.allowedDomainSuffixes) {
             dnsTracker.AddAllowedDomainSuffix(suffix);
         }
     }
-    // Ensure default mojang/minecraft suffixes are whitelisted
-    dnsTracker.AddAllowedDomainSuffix("mojang.com");
-    dnsTracker.AddAllowedDomainSuffix("minecraft.net");
-    dnsTracker.AddAllowedDomainSuffix("minecraftservices.com");
 
     dnsTracker.SetWhitelistIpCallback([&wfp, &correlator, &view, &whitelist, isElevated](const std::string& domain, const std::string& ip) {
         core::WhitelistRule rule;

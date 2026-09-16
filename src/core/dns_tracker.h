@@ -24,6 +24,7 @@ public:
 
     // Whitelisted domain suffixes (e.g. "mojang.com", "minecraft.net", "minecraftservices.com")
     void AddAllowedDomainSuffix(const std::string& suffix);
+    void ClearAllowedDomainSuffixes();
     bool IsDomainWhitelisted(const std::string& domain) const;
     const std::vector<std::string>& GetAllowedDomainSuffixes() const { return m_allowedSuffixes; }
 

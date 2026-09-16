@@ -116,7 +116,11 @@ MCGuard.exe watch --whitelist 1.2.3.4:25565 --whitelist 114.114.114.114:53
     "default_policy": "BLOCK",
     "allow_localhost": true,
     "allow_dns": true,
-    "allow_mojang_auth": true,
+    "allowed_domain_suffixes": [
+      "mojang.com",
+      "minecraft.net",
+      "minecraftservices.com"
+    ],
     "whitelist": [
       {
         "description": "Target Minecraft Server",
