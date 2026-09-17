@@ -134,14 +134,27 @@ bool SandboxLauncher::GrantFullAccessToFolder(const std::wstring& folderPath) {
     PACL pNewDacl = NULL;
     res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
     if (res == ERROR_SUCCESS && pNewDacl) {
-        SetNamedSecurityInfoW(
-            (LPWSTR)folderPath.c_str(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            NULL, NULL,
-            pNewDacl,
-            NULL
-        );
+        SECURITY_DESCRIPTOR sd;
+        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
+            if (SetSecurityDescriptorDacl(&sd, TRUE, pNewDacl, FALSE)) {
+                SECURITY_DESCRIPTOR_CONTROL control = 0;
+                DWORD revision = 0;
+                if (pSD && GetSecurityDescriptorControl(pSD, &control, &revision)) {
+                    SECURITY_DESCRIPTOR_CONTROL mask = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
+                    SetSecurityDescriptorControl(&sd, mask, control & mask);
+                }
+                if (!SetFileSecurityW(folderPath.c_str(), DACL_SECURITY_INFORMATION, &sd)) {
+                    SetNamedSecurityInfoW(
+                        (LPWSTR)folderPath.c_str(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        NULL, NULL,
+                        pNewDacl,
+                        NULL
+                    );
+                }
+            }
+        }
     }
 
     if (pNewDacl) LocalFree(pNewDacl);
@@ -247,14 +260,27 @@ bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPa
     PACL pNewDacl = NULL;
     res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
     if (res == ERROR_SUCCESS && pNewDacl) {
-        SetNamedSecurityInfoW(
-            (LPWSTR)folderPath.c_str(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            NULL, NULL,
-            pNewDacl,
-            NULL
-        );
+        SECURITY_DESCRIPTOR sd;
+        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
+            if (SetSecurityDescriptorDacl(&sd, TRUE, pNewDacl, FALSE)) {
+                SECURITY_DESCRIPTOR_CONTROL control = 0;
+                DWORD revision = 0;
+                if (pSD && GetSecurityDescriptorControl(pSD, &control, &revision)) {
+                    SECURITY_DESCRIPTOR_CONTROL mask = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
+                    SetSecurityDescriptorControl(&sd, mask, control & mask);
+                }
+                if (!SetFileSecurityW(folderPath.c_str(), DACL_SECURITY_INFORMATION, &sd)) {
+                    SetNamedSecurityInfoW(
+                        (LPWSTR)folderPath.c_str(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        NULL, NULL,
+                        pNewDacl,
+                        NULL
+                    );
+                }
+            }
+        }
     }
 
     if (pNewDacl) LocalFree(pNewDacl);
@@ -652,7 +678,13 @@ bool SandboxLauncher::LaunchSandboxedProcess(
 
     wchar_t tempPath[MAX_PATH] = { 0 };
     if (GetTempPathW(MAX_PATH, tempPath)) {
-        grantDirAccess(tempPath);
+        if (options.denyUserSid) {
+            GrantAncestorsTraverseAccess(tempPath);
+            GrantFullAccessToFolder(tempPath);
+        }
+        if (options.lowIntegrity) {
+            GrantLowIntegrityAccessToFolder(tempPath);
+        }
     }
 
     // Only apply NRNW disk labels if denyUserSid is disabled (legacy fallback)
