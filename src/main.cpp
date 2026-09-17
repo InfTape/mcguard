@@ -569,17 +569,13 @@ int main(int argc, char* argv[]) {
         dnsTracker.PreResolveCommonEndpoints();
 
         // 7. If running without a visible console window (e.g. launched by HMCL / PCL with CREATE_NO_WINDOW),
-        // spawn conhost.exe to display an independent, authentic, interactive monitor window on the desktop!
+        // spawn a dedicated monitor process to display an independent, authentic, interactive monitor window on the desktop!
         HWND hCurrentConsole = GetConsoleWindow();
         if (hCurrentConsole == NULL || !IsWindowVisible(hCurrentConsole)) {
-            wchar_t sysDir[MAX_PATH];
-            GetSystemDirectoryW(sysDir, MAX_PATH);
-            std::wstring conhostPath = std::wstring(sysDir) + L"\\conhost.exe";
-
             wchar_t exePath[MAX_PATH];
             GetModuleFileNameW(NULL, exePath, MAX_PATH);
 
-            std::wstring monCmd = L"\"" + conhostPath + L"\" \"" + exePath + L"\" monitor --pid " +
+            std::wstring monCmd = L"\"" + std::wstring(exePath) + L"\" monitor --pid " +
                                   std::to_wstring(procInfo.processId) + L" --audit \"" +
                                   util::Utf8ToWide(view.GetLogFilePath()) + L"\"";
             std::vector<wchar_t> monCmdBuf(monCmd.begin(), monCmd.end());
@@ -588,11 +584,47 @@ int main(int argc, char* argv[]) {
             STARTUPINFOW monSi = { sizeof(monSi) };
             monSi.dwFlags = STARTF_USESHOWWINDOW;
             monSi.wShowWindow = SW_SHOWNORMAL;
+            monSi.lpDesktop = (LPWSTR)L"WinSta0\\Default";
             PROCESS_INFORMATION monPi = { 0 };
 
-            if (CreateProcessW(conhostPath.c_str(), monCmdBuf.data(), NULL, NULL, FALSE, 0, NULL, NULL, &monSi, &monPi)) {
+            // Primary: Direct invocation with CREATE_NEW_CONSOLE bound to interactive desktop
+            BOOL monOk = CreateProcessW(
+                exePath,
+                monCmdBuf.data(),
+                NULL, NULL, FALSE,
+                CREATE_NEW_CONSOLE,
+                NULL, NULL,
+                &monSi, &monPi
+            );
+
+            if (!monOk) {
+                // Fallback: via conhost.exe
+                wchar_t sysDir[MAX_PATH];
+                GetSystemDirectoryW(sysDir, MAX_PATH);
+                std::wstring conhostPath = std::wstring(sysDir) + L"\\conhost.exe";
+
+                std::wstring conhostCmd = L"\"" + conhostPath + L"\" \"" + exePath + L"\" monitor --pid " +
+                                          std::to_wstring(procInfo.processId) + L" --audit \"" +
+                                          util::Utf8ToWide(view.GetLogFilePath()) + L"\"";
+                std::vector<wchar_t> conhostBuf(conhostCmd.begin(), conhostCmd.end());
+                conhostBuf.push_back(L'\0');
+
+                monOk = CreateProcessW(
+                    conhostPath.c_str(),
+                    conhostBuf.data(),
+                    NULL, NULL, FALSE,
+                    CREATE_NEW_CONSOLE,
+                    NULL, NULL,
+                    &monSi, &monPi
+                );
+            }
+
+            if (monOk) {
                 CloseHandle(monPi.hProcess);
                 CloseHandle(monPi.hThread);
+                view.PrintSuccess("Dedicated Security Monitor console window launched.");
+            } else {
+                view.PrintError("Failed to launch monitor console: error " + std::to_string(GetLastError()));
             }
         }
 
