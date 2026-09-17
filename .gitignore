@@ -17,3 +17,5 @@
 build/
 out/
 test/
+testmod/bin/
+testmod/*.jar

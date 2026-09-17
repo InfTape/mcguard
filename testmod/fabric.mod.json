@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "mcguard-testmod",
+  "version": "1.0.0",
+  "name": "MCGuard Test Mod",
+  "description": "Security test mod to verify file access control under MCGuard sandbox",
+  "authors": [
+    "MCGuard"
+  ],
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.mcguard.testmod.TestMod"
+    ],
+    "client": [
+      "com.mcguard.testmod.TestMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.0"
+  }
+}
