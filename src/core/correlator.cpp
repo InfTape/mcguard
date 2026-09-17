@@ -229,6 +229,21 @@ void Correlator::OnEtwEvent(const EtwEvent& ev) {
             break;
         }
 
+        case EtwEventType::FILE_ACCESS_DENIED: {
+            record.type = "FILE_BLOCK";
+            record.action = AuditAction::BLOCK;
+            record.isSensitive = true;
+            bool isSens = IsSensitiveFile(targetUtf8);
+            if (isSens) {
+                record.source = "Sensitive File Blocked (Denied)";
+                record.details = "Protected sensitive file access blocked by kernel (STATUS_ACCESS_DENIED 0xC0000022)";
+            } else {
+                record.source = "Sandbox Blocked (Denied)";
+                record.details = "File access blocked by kernel sandbox (STATUS_ACCESS_DENIED 0xC0000022)";
+            }
+            break;
+        }
+
         case EtwEventType::FILE_CREATE:
         case EtwEventType::FILE_READ:
         case EtwEventType::FILE_WRITE:
@@ -239,10 +254,23 @@ void Correlator::OnEtwEvent(const EtwEvent& ev) {
             else record.type = "FILE_DELETE";
 
             bool isSens = IsSensitiveFile(targetUtf8);
-            record.isSensitive = isSens;
-
             std::string folderDesc;
             bool inFolderWhitelist = IsPathInFolderWhitelist(ev.target, folderDesc);
+
+            // If the file is inside the whitelisted game folder, ignore sensitive flag if it only matched a parent directory path
+            if (inFolderWhitelist && isSens) {
+                bool specificallySensitive = false;
+                for (const auto& pat : m_sensitivePatterns) {
+                    if (pat.find('\\') == std::string::npos && pat.find('/') == std::string::npos) {
+                        if (util::ContainsIgnoreCase(targetUtf8, pat)) {
+                            specificallySensitive = true;
+                            break;
+                        }
+                    }
+                }
+                isSens = specificallySensitive;
+            }
+            record.isSensitive = isSens;
 
             if (isSens) {
                 record.action = AuditAction::ALERT;

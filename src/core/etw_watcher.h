@@ -11,6 +11,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstdint>
+#include <unordered_map>
 
 namespace mcguard {
 namespace core {
@@ -21,6 +22,7 @@ enum class EtwEventType {
     FILE_WRITE,
     FILE_DELETE,
     FILE_RENAME,
+    FILE_ACCESS_DENIED,
     TCP_CONNECT,
     TCP_SEND,
     TCP_RECV,
@@ -33,6 +35,7 @@ struct EtwEvent {
     EtwEventType type = EtwEventType::UNKNOWN;
     std::wstring target; // File path or IP:Port
     uint16_t port = 0;
+    uint32_t status = 0; // NTSTATUS code (e.g. 0xC0000022 STATUS_ACCESS_DENIED)
     std::string timestamp;
 };
 
@@ -68,6 +71,15 @@ private:
 
     std::set<DWORD> m_targetPids;
     std::mutex m_pidMutex;
+
+    struct PendingFileOp {
+        DWORD pid = 0;
+        DWORD tid = 0;
+        std::wstring target;
+        std::string timestamp;
+    };
+    std::unordered_map<ULONGLONG, PendingFileOp> m_pendingCreates;
+    std::mutex m_pendingMutex;
 
     static EtwWatcher* s_instance;
     EventCallback m_callback;

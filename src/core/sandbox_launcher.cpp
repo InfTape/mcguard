@@ -12,28 +12,45 @@
 namespace mcguard {
 namespace core {
 
-HANDLE SandboxLauncher::CreateLowIntegrityRestrictedToken(bool stripPrivileges, bool lowIntegrity, std::string& outError) {
+HANDLE SandboxLauncher::CreateLowIntegrityRestrictedToken(bool stripPrivileges, bool lowIntegrity, bool denyUserSid, std::string& outError) {
     HANDLE hCurrentToken = NULL;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, &hCurrentToken)) {
         outError = "Failed to open current process token: " + std::to_string(GetLastError());
         return NULL;
     }
 
+    DWORD flags = stripPrivileges ? DISABLE_MAX_PRIVILEGE : 0;
+    std::vector<SID_AND_ATTRIBUTES> sidsToDisable;
+
+    if (denyUserSid) {
+        DWORD len = 0;
+        GetTokenInformation(hCurrentToken, TokenUser, NULL, 0, &len);
+        if (len > 0) {
+            std::vector<BYTE> userBuf(len);
+            PTOKEN_USER pUser = (PTOKEN_USER)userBuf.data();
+            if (GetTokenInformation(hCurrentToken, TokenUser, pUser, len, &len)) {
+                SID_AND_ATTRIBUTES sa = { 0 };
+                sa.Sid = pUser->User.Sid;
+                sa.Attributes = 0; // SE_GROUP_USE_FOR_DENY_ONLY
+                sidsToDisable.push_back(sa);
+            }
+        }
+    }
+
     HANDLE hTargetToken = NULL;
-    if (stripPrivileges) {
-        // Create restricted token stripping administrative and sensitive privileges
-        if (!CreateRestrictedToken(hCurrentToken, DISABLE_MAX_PRIVILEGE, 0, NULL, 0, NULL, 0, NULL, &hTargetToken)) {
-            outError = "CreateRestrictedToken failed: " + std::to_string(GetLastError());
-            CloseHandle(hCurrentToken);
-            return NULL;
-        }
-    } else {
-        // Duplicate token if privilege stripping is not requested
-        if (!DuplicateTokenEx(hCurrentToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hTargetToken)) {
-            outError = "DuplicateTokenEx failed: " + std::to_string(GetLastError());
-            CloseHandle(hCurrentToken);
-            return NULL;
-        }
+    // Always call CreateRestrictedToken so the resulting token is marked as a restricted token
+    // of the caller, exempting standard non-administrator users from SeAssignPrimaryTokenPrivilege.
+    if (!CreateRestrictedToken(
+            hCurrentToken,
+            flags,
+            (DWORD)sidsToDisable.size(),
+            sidsToDisable.empty() ? NULL : sidsToDisable.data(),
+            0, NULL,
+            0, NULL,
+            &hTargetToken)) {
+        outError = "CreateRestrictedToken failed: " + std::to_string(GetLastError());
+        CloseHandle(hCurrentToken);
+        return NULL;
     }
     CloseHandle(hCurrentToken);
 
@@ -47,12 +64,129 @@ HANDLE SandboxLauncher::CreateLowIntegrityRestrictedToken(bool stripPrivileges, 
 
             if (!SetTokenInformation(hTargetToken, TokenIntegrityLevel, &tml, sizeof(tml) + GetLengthSid(pLowSid))) {
                 outError = "SetTokenInformation(TokenIntegrityLevel) failed: " + std::to_string(GetLastError());
+                LocalFree(pLowSid);
+                CloseHandle(hTargetToken);
+                return NULL;
             }
             LocalFree(pLowSid);
+        } else {
+            outError = "ConvertStringSidToSidW failed: " + std::to_string(GetLastError());
+            CloseHandle(hTargetToken);
+            return NULL;
         }
     }
 
     return hTargetToken;
+}
+
+bool SandboxLauncher::GrantFullAccessToFolder(const std::wstring& folderPath) {
+    if (folderPath.empty()) return false;
+
+    PACL pOldDacl = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    DWORD res = GetNamedSecurityInfoW(
+        (LPWSTR)folderPath.c_str(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        NULL, NULL,
+        &pOldDacl,
+        NULL,
+        &pSD
+    );
+    if (res != ERROR_SUCCESS) return false;
+
+    PSID pUsersSid = NULL;
+    if (!ConvertStringSidToSidW(L"S-1-5-32-545", &pUsersSid)) { // BUILTIN\Users
+        if (pSD) LocalFree(pSD);
+        return false;
+    }
+
+    EXPLICIT_ACCESS_W ea = { 0 };
+    ea.grfAccessPermissions = GENERIC_ALL;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = (LPWSTR)pUsersSid;
+
+    PACL pNewDacl = NULL;
+    res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
+    if (res == ERROR_SUCCESS && pNewDacl) {
+        SetNamedSecurityInfoW(
+            (LPWSTR)folderPath.c_str(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            NULL, NULL,
+            pNewDacl,
+            NULL
+        );
+    }
+
+    if (pNewDacl) LocalFree(pNewDacl);
+    if (pUsersSid) LocalFree(pUsersSid);
+    if (pSD) LocalFree(pSD);
+
+    return (res == ERROR_SUCCESS);
+}
+
+bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPath) {
+    if (folderPath.empty() || folderPath.length() <= 3) return true;
+
+    PACL pOldDacl = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    DWORD res = GetNamedSecurityInfoW(
+        (LPWSTR)folderPath.c_str(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        NULL, NULL,
+        &pOldDacl,
+        NULL,
+        &pSD
+    );
+    if (res != ERROR_SUCCESS) return false;
+
+    PSID pUsersSid = NULL;
+    if (!ConvertStringSidToSidW(L"S-1-5-32-545", &pUsersSid)) { // BUILTIN\Users
+        if (pSD) LocalFree(pSD);
+        return false;
+    }
+
+    EXPLICIT_ACCESS_W ea = { 0 };
+    ea.grfAccessPermissions = FILE_GENERIC_READ | FILE_TRAVERSE;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE; // Crucial: NEVER inherit to children/files (so desktop files remain blocked!)
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = (LPWSTR)pUsersSid;
+
+    PACL pNewDacl = NULL;
+    res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
+    if (res == ERROR_SUCCESS && pNewDacl) {
+        SetNamedSecurityInfoW(
+            (LPWSTR)folderPath.c_str(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            NULL, NULL,
+            pNewDacl,
+            NULL
+        );
+    }
+
+    if (pNewDacl) LocalFree(pNewDacl);
+    if (pUsersSid) LocalFree(pUsersSid);
+    if (pSD) LocalFree(pSD);
+
+    return (res == ERROR_SUCCESS);
+}
+
+void SandboxLauncher::GrantAncestorsTraverseAccess(const std::wstring& targetPath) {
+    std::wstring path = targetPath;
+    while (!path.empty() && path.length() > 3) {
+        size_t lastSlash = path.find_last_of(L"\\/");
+        if (lastSlash == std::wstring::npos || lastSlash <= 2) break;
+        path = path.substr(0, lastSlash);
+        GrantTraverseAccessToAncestor(path);
+    }
 }
 
 bool SandboxLauncher::GrantLowIntegrityAccessToFolder(const std::wstring& folderPath) {
@@ -100,7 +234,22 @@ static std::wstring ExpandEnvironmentPath(const std::wstring& inPath) {
     return result;
 }
 
-bool SandboxLauncher::ProtectPathFromLowIntegrity(const std::wstring& targetPath) {
+static bool IsPathOverlapping(const std::wstring& pathA, const std::wstring& pathB) {
+    if (pathA.empty() || pathB.empty()) return false;
+    std::wstring a = pathA;
+    std::wstring b = pathB;
+    for (auto& ch : a) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+    for (auto& ch : b) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+    while (!a.empty() && a.back() == L'\\') a.pop_back();
+    while (!b.empty() && b.back() == L'\\') b.pop_back();
+
+    if (a == b) return true;
+    if (a.length() > b.length() && a.rfind(b + L'\\', 0) == 0) return true;
+    if (b.length() > a.length() && b.rfind(a + L'\\', 0) == 0) return true;
+    return false;
+}
+
+bool SandboxLauncher::ProtectPathFromLowIntegrity(const std::wstring& targetPath, const std::wstring& excludeDir) {
     if (targetPath.empty()) return false;
 
     std::wstring expanded = ExpandEnvironmentPath(targetPath);
@@ -134,17 +283,175 @@ bool SandboxLauncher::ProtectPathFromLowIntegrity(const std::wstring& targetPath
     );
 
     LocalFree(pSD);
+
+    // If it's a directory, also protect existing files directly under this directory
+    // because SetNamedSecurityInfo does not automatically propagate to pre-existing child files.
+    if (res == ERROR_SUCCESS && isDir) {
+        PSECURITY_DESCRIPTOR pSDFile = NULL;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NRNW;;;ME)", SDDL_REVISION_1, &pSDFile, NULL)) {
+            PACL pFileSacl = NULL;
+            GetSecurityDescriptorSacl(pSDFile, &saclPresent, &pFileSacl, &saclDefaulted);
+
+            std::wstring searchPattern = expanded;
+            if (searchPattern.back() != L'\\') searchPattern += L'\\';
+            searchPattern += L"*";
+
+            WIN32_FIND_DATAW fd;
+            HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+                    std::wstring childPath = expanded;
+                    if (childPath.back() != L'\\') childPath += L'\\';
+                    childPath += fd.cFileName;
+
+                    // Skip any item that contains or is inside excludeDir (e.g. gameDir or HMCL)
+                    if (!excludeDir.empty() && IsPathOverlapping(childPath, excludeDir)) {
+                        continue;
+                    }
+
+                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        // Apply NRNW to pre-existing file
+                        SetNamedSecurityInfoW(
+                            (LPWSTR)childPath.c_str(),
+                            SE_FILE_OBJECT,
+                            LABEL_SECURITY_INFORMATION,
+                            NULL, NULL, NULL,
+                            pFileSacl
+                        );
+                    }
+                } while (FindNextFileW(hFind, &fd));
+                FindClose(hFind);
+            }
+
+            LocalFree(pSDFile);
+        }
+    }
+
     return (res == ERROR_SUCCESS);
 }
 
-void SandboxLauncher::ApplyProtectedPaths(const std::vector<std::string>& paths, std::vector<std::wstring>& outApplied) {
+void SandboxLauncher::ApplyProtectedPaths(
+    const std::vector<std::string>& paths,
+    std::vector<std::wstring>& outApplied,
+    const std::wstring& excludeDir
+) {
     for (const auto& p : paths) {
         if (p.empty()) continue;
         std::wstring wPath = util::Utf8ToWide(p);
         std::wstring expanded = ExpandEnvironmentPath(wPath);
-        if (ProtectPathFromLowIntegrity(expanded)) {
+        if (ProtectPathFromLowIntegrity(expanded, excludeDir)) {
             outApplied.push_back(expanded);
         }
+    }
+}
+
+bool SandboxLauncher::RestorePathIntegrity(const std::wstring& targetPath, const std::wstring& excludeDir) {
+    if (targetPath.empty()) return false;
+
+    std::wstring expanded = ExpandEnvironmentPath(targetPath);
+    DWORD attr = GetFileAttributesW(expanded.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+
+    bool isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    // Restore to standard default: Medium Mandatory Level with No-Write-Up (NW)
+    const wchar_t* sddl = isDir ? L"S:(ML;OICI;NW;;;ME)" : L"S:(ML;;NW;;;ME)";
+
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &pSD, NULL)) {
+        return false;
+    }
+
+    PACL pSacl = NULL;
+    BOOL saclPresent = FALSE, saclDefaulted = FALSE;
+    GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
+
+    DWORD res = SetNamedSecurityInfoW(
+        (LPWSTR)expanded.c_str(),
+        SE_FILE_OBJECT,
+        LABEL_SECURITY_INFORMATION,
+        NULL,
+        NULL,
+        NULL,
+        pSacl
+    );
+
+    LocalFree(pSD);
+
+    if (res == ERROR_SUCCESS && isDir) {
+        // Also restore files under this directory
+        PSECURITY_DESCRIPTOR pSDFile = NULL;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;ME)", SDDL_REVISION_1, &pSDFile, NULL)) {
+            PACL pFileSacl = NULL;
+            GetSecurityDescriptorSacl(pSDFile, &saclPresent, &pFileSacl, &saclDefaulted);
+
+            std::wstring searchPattern = expanded;
+            if (searchPattern.back() != L'\\') searchPattern += L'\\';
+            searchPattern += L"*";
+
+            WIN32_FIND_DATAW fd;
+            HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+                    std::wstring childPath = expanded;
+                    if (childPath.back() != L'\\') childPath += L'\\';
+                    childPath += fd.cFileName;
+
+                    if (!excludeDir.empty() && IsPathOverlapping(childPath, excludeDir)) {
+                        continue;
+                    }
+
+                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        SetNamedSecurityInfoW(
+                            (LPWSTR)childPath.c_str(),
+                            SE_FILE_OBJECT,
+                            LABEL_SECURITY_INFORMATION,
+                            NULL, NULL, NULL,
+                            pFileSacl
+                        );
+                    }
+                } while (FindNextFileW(hFind, &fd));
+                FindClose(hFind);
+            }
+
+            LocalFree(pSDFile);
+        }
+    }
+
+    return (res == ERROR_SUCCESS);
+}
+
+void SandboxLauncher::RestoreProtectedPaths(const std::vector<std::wstring>& paths, const std::wstring& excludeDir) {
+    for (const auto& p : paths) {
+        RestorePathIntegrity(p, excludeDir);
+    }
+}
+
+static void GrantSubdirectoriesAccess(const std::wstring& rootDir) {
+    if (rootDir.empty()) return;
+    std::wstring searchPattern = rootDir;
+    if (searchPattern.back() != L'\\') searchPattern += L'\\';
+    searchPattern += L"*";
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                std::wstring subPath = rootDir;
+                if (subPath.back() != L'\\') subPath += L'\\';
+                subPath += fd.cFileName;
+                SandboxLauncher::GrantFullAccessToFolder(subPath);
+                SandboxLauncher::GrantLowIntegrityAccessToFolder(subPath);
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
     }
 }
 
@@ -155,24 +462,51 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     SandboxProcessInfo& outInfo,
     std::string& outError
 ) {
-    // 1. Grant Low-Integrity access to target game directory and temp folder
-    if (options.lowIntegrity) {
-        if (!options.gameDir.empty()) {
+    // 1. Configure Mandatory Integrity Control & DACL Access
+    if (!options.gameDir.empty()) {
+        if (options.denyUserSid) {
+            GrantAncestorsTraverseAccess(options.gameDir);
+            GrantFullAccessToFolder(options.gameDir);
+            GrantSubdirectoriesAccess(options.gameDir);
+        }
+        if (options.lowIntegrity) {
             GrantLowIntegrityAccessToFolder(options.gameDir);
         }
-        wchar_t tempPath[MAX_PATH] = { 0 };
-        if (GetTempPathW(MAX_PATH, tempPath)) {
+    }
+
+    wchar_t tempPath[MAX_PATH] = { 0 };
+    if (GetTempPathW(MAX_PATH, tempPath)) {
+        if (options.denyUserSid) {
+            GrantAncestorsTraverseAccess(tempPath);
+            GrantFullAccessToFolder(tempPath);
+        }
+        if (options.lowIntegrity) {
             GrantLowIntegrityAccessToFolder(tempPath);
         }
+    }
 
-        // Apply No-Read-Up & No-Write-Up protection to protected paths
+    // Only apply NRNW disk labels if denyUserSid is disabled (legacy fallback)
+    if (options.lowIntegrity && !options.denyUserSid) {
         for (const auto& p : options.protectedPaths) {
-            ProtectPathFromLowIntegrity(p);
+            ProtectPathFromLowIntegrity(p, options.gameDir);
         }
     }
 
     // 2. Prepare stdout & stderr redirection pipes
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    PSECURITY_DESCRIPTOR pPipeSD = NULL;
+    if (options.lowIntegrity) {
+        // Grant write permissions to World and mark with Low Mandatory Level (NW)
+        // so that a Low Integrity child process can write to stdout/stderr pipes without ERROR_ACCESS_DENIED.
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:(A;;GA;;;WD)S:(ML;;NW;;;LW)",
+                SDDL_REVISION_1,
+                &pPipeSD,
+                NULL)) {
+            sa.lpSecurityDescriptor = pPipeSD;
+        }
+    }
+
     HANDLE hChildStdOutRead = NULL, hChildStdOutWrite = NULL;
     HANDLE hChildStdErrRead = NULL, hChildStdErrWrite = NULL;
 
@@ -183,10 +517,16 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         SetHandleInformation(hChildStdErrRead, HANDLE_FLAG_INHERIT, 0);
         pipesCreated = true;
     }
+    if (pPipeSD) {
+        LocalFree(pPipeSD);
+        pPipeSD = NULL;
+    }
 
     // Prepare ProcThreadAttributeList for Mitigation Policy and Handle Inheritance
     STARTUPINFOEXW siex = { 0 };
     siex.StartupInfo.cb = sizeof(siex);
+    std::wstring desktopName = L"winsta0\\default";
+    siex.StartupInfo.lpDesktop = (LPWSTR)desktopName.c_str();
 
     std::vector<BYTE> attrBuffer;
     LPPROC_THREAD_ATTRIBUTE_LIST attrList = NULL;
@@ -240,8 +580,18 @@ bool SandboxLauncher::LaunchSandboxedProcess(
 
     // 3. Obtain restricted primary token
     HANDLE hToken = NULL;
-    if (options.stripPrivileges || options.lowIntegrity) {
-        hToken = CreateLowIntegrityRestrictedToken(options.stripPrivileges, options.lowIntegrity, outError);
+    bool tokenRequested = (options.stripPrivileges || options.lowIntegrity || options.denyUserSid);
+    if (tokenRequested) {
+        hToken = CreateLowIntegrityRestrictedToken(options.stripPrivileges, options.lowIntegrity, options.denyUserSid, outError);
+        if (!hToken) {
+            // Token creation failed. Refuse to launch un-sandboxed process.
+            if (attrList) DeleteProcThreadAttributeList(attrList);
+            if (hChildStdOutWrite) CloseHandle(hChildStdOutWrite);
+            if (hChildStdErrWrite) CloseHandle(hChildStdErrWrite);
+            if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
+            if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
+            return false;
+        }
     }
 
     // 4. Configure process creation flags
@@ -272,12 +622,28 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         );
         if (!success) {
             DWORD err = GetLastError();
-            outError = "CreateProcessAsUserW failed (code " + std::to_string(err) + "). Trying CreateProcessW fallback...";
+            outError = "CreateProcessAsUserW failed (code " + std::to_string(err) + ")";
+            if (!options.allowInsecureFallback) {
+                // Fail-Closed: Abort launch to prevent running with Medium/High IL
+                outError += ". Sandbox launch aborted to prevent untrusted process from running outside Low-Integrity sandbox.";
+                if (attrList) DeleteProcThreadAttributeList(attrList);
+                CloseHandle(hToken);
+                if (hChildStdOutWrite) CloseHandle(hChildStdOutWrite);
+                if (hChildStdErrWrite) CloseHandle(hChildStdErrWrite);
+                if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
+                if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
+                return false;
+            }
+            outError += ". [WARNING] Insecure fallback to CreateProcessW (Medium/High IL) allowed by configuration!";
+        } else {
+            outInfo.isLowIntegrity = options.lowIntegrity;
+            outInfo.privilegesStripped = options.stripPrivileges;
+            outInfo.userSidDenied = options.denyUserSid;
         }
     }
 
     if (!success) {
-        // Fallback to CreateProcessW with mitigation policies
+        // Fallback to CreateProcessW only if token was not requested OR insecure fallback was explicitly permitted
         success = CreateProcessW(
             applicationPath.empty() ? NULL : applicationPath.c_str(),
             cmdLineBuf.data(),
@@ -300,6 +666,8 @@ bool SandboxLauncher::LaunchSandboxedProcess(
             if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
             return false;
         }
+        outInfo.isLowIntegrity = false;
+        outInfo.privilegesStripped = false;
     }
 
     // Close parent's copies of write handles so EOF unblocks when child terminates

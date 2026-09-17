@@ -342,6 +342,12 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
             std::string ujo = FindJsonFieldValue(sbStr, "use_job_object");
             if (!ujo.empty()) outConfig.sandbox.useJobObject = (ujo == "true");
 
+            std::string roe = FindJsonFieldValue(sbStr, "restore_on_exit");
+            if (!roe.empty()) outConfig.sandbox.restoreOnExit = (roe == "true");
+
+            std::string dus = FindJsonFieldValue(sbStr, "deny_user_sid");
+            if (!dus.empty()) outConfig.sandbox.denyUserSid = (dus == "true");
+
             std::string rjp = FindJsonFieldValue(sbStr, "real_java_path");
             if (!rjp.empty()) outConfig.sandbox.realJavaPath = rjp;
         }

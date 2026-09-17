@@ -9,6 +9,9 @@
 # Audit logs
 *.jsonl
 
+# Logs
+*.log
+
 # IDE & temporary
 .vs/
 build/

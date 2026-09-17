@@ -12,7 +12,7 @@ namespace core {
 
 // Provider GUIDs
 static const GUID KernelFileProviderGuid = 
-    { 0xedd08927, 0x9cc4, 0x4e65, { 0xb9, 0x70, 0xc2, 0x56, 0x0f, 0x5c, 0x48, 0x24 } };
+    { 0xedd08927, 0x9cc4, 0x4e65, { 0xb9, 0x70, 0xc2, 0x56, 0x0f, 0xb5, 0xc2, 0x89 } };
 
 static const GUID KernelNetworkProviderGuid = 
     { 0x7dd42a49, 0x5329, 0x4832, { 0x8d, 0xfd, 0x43, 0xd9, 0x79, 0x15, 0x3a, 0x88 } };
@@ -148,6 +148,70 @@ void EtwWatcher::TraceWorkerThread(EventCallback callback) {
     m_running = false;
 }
 
+static bool GetTdhPropertyPointer(PEVENT_RECORD pEventRecord, PTRACE_EVENT_INFO pInfo, const wchar_t* targetName, ULONGLONG& outVal) {
+    for (ULONG i = 0; i < pInfo->TopLevelPropertyCount; ++i) {
+        LPWSTR propName = (LPWSTR)((PBYTE)pInfo + pInfo->EventPropertyInfoArray[i].NameOffset);
+        if (_wcsicmp(propName, targetName) == 0) {
+            PROPERTY_DATA_DESCRIPTOR desc = { 0 };
+            desc.PropertyName = (ULONGLONG)propName;
+            desc.ArrayIndex = ULONG_MAX;
+            DWORD propSize = 0;
+            TdhGetPropertySize(pEventRecord, 0, NULL, 1, &desc, &propSize);
+            if (propSize == sizeof(ULONGLONG)) {
+                return TdhGetProperty(pEventRecord, 0, NULL, 1, &desc, propSize, (PBYTE)&outVal) == ERROR_SUCCESS;
+            } else if (propSize == sizeof(DWORD)) {
+                DWORD d = 0;
+                if (TdhGetProperty(pEventRecord, 0, NULL, 1, &desc, propSize, (PBYTE)&d) == ERROR_SUCCESS) {
+                    outVal = d;
+                    return true;
+                }
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+static bool GetTdhPropertyUInt32(PEVENT_RECORD pEventRecord, PTRACE_EVENT_INFO pInfo, const wchar_t* targetName, uint32_t& outVal) {
+    for (ULONG i = 0; i < pInfo->TopLevelPropertyCount; ++i) {
+        LPWSTR propName = (LPWSTR)((PBYTE)pInfo + pInfo->EventPropertyInfoArray[i].NameOffset);
+        if (_wcsicmp(propName, targetName) == 0) {
+            PROPERTY_DATA_DESCRIPTOR desc = { 0 };
+            desc.PropertyName = (ULONGLONG)propName;
+            desc.ArrayIndex = ULONG_MAX;
+            DWORD propSize = 0;
+            TdhGetPropertySize(pEventRecord, 0, NULL, 1, &desc, &propSize);
+            if (propSize == sizeof(uint32_t)) {
+                return TdhGetProperty(pEventRecord, 0, NULL, 1, &desc, propSize, (PBYTE)&outVal) == ERROR_SUCCESS;
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+static bool GetTdhPropertyString(PEVENT_RECORD pEventRecord, PTRACE_EVENT_INFO pInfo, const wchar_t* targetName, std::wstring& outVal) {
+    for (ULONG i = 0; i < pInfo->TopLevelPropertyCount; ++i) {
+        LPWSTR propName = (LPWSTR)((PBYTE)pInfo + pInfo->EventPropertyInfoArray[i].NameOffset);
+        if (_wcsicmp(propName, targetName) == 0) {
+            PROPERTY_DATA_DESCRIPTOR desc = { 0 };
+            desc.PropertyName = (ULONGLONG)propName;
+            desc.ArrayIndex = ULONG_MAX;
+            DWORD propSize = 0;
+            TdhGetPropertySize(pEventRecord, 0, NULL, 1, &desc, &propSize);
+            if (propSize > 0) {
+                std::vector<BYTE> buf(propSize + 2, 0);
+                if (TdhGetProperty(pEventRecord, 0, NULL, 1, &desc, propSize, buf.data()) == ERROR_SUCCESS) {
+                    outVal = (LPWSTR)buf.data();
+                    return true;
+                }
+            }
+            break;
+        }
+    }
+    return false;
+}
+
 VOID WINAPI EtwWatcher::EventRecordCallback(PEVENT_RECORD pEventRecord) {
     if (!s_instance || !pEventRecord) return;
 
@@ -203,89 +267,165 @@ VOID WINAPI EtwWatcher::EventRecordCallback(PEVENT_RECORD pEventRecord) {
     }
 
     DWORD pid = pEventRecord->EventHeader.ProcessId;
+    bool isFileProvider = IsEqualGUID(providerId, KernelFileProviderGuid);
+    USHORT eventId = pEventRecord->EventHeader.EventDescriptor.Id;
 
-    // Check if pid is monitored for File / Network I/O
-    {
-        std::lock_guard<std::mutex> lock(s_instance->m_pidMutex);
-        if (s_instance->m_targetPids.empty()) {
-            return;
-        }
-        if (s_instance->m_targetPids.find(pid) == s_instance->m_targetPids.end()) {
-            return;
-        }
-    }
-
-    EtwEvent ev;
-    ev.pid = pid;
-    ev.tid = pEventRecord->EventHeader.ThreadId;
-    ev.timestamp = util::GetCurrentTimeString();
-
-    // 1. Check File Events
-    if (IsEqualGUID(providerId, KernelFileProviderGuid)) {
-        UCHAR opcode = pEventRecord->EventHeader.EventDescriptor.Opcode;
-        switch (opcode) {
-            case 10:
-            case 12:
-                ev.type = EtwEventType::FILE_CREATE;
-                break;
-            case 14:
-                ev.type = EtwEventType::FILE_DELETE;
-                break;
-            case 15:
-                ev.type = EtwEventType::FILE_READ;
-                break;
-            case 16:
-                ev.type = EtwEventType::FILE_WRITE;
-                break;
-            case 17:
-                ev.type = EtwEventType::FILE_RENAME;
-                break;
-            default:
-                ev.type = EtwEventType::FILE_READ;
-                break;
-        }
-
-        // Parse event properties using TDH to get FileName
-        DWORD bufferSize = 0;
-        TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
-        if (bufferSize > 0) {
-            std::vector<BYTE> infoBuffer(bufferSize);
-            auto pInfo = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuffer.data());
-            if (TdhGetEventInformation(pEventRecord, 0, NULL, pInfo, &bufferSize) == ERROR_SUCCESS) {
-                for (ULONG i = 0; i < pInfo->TopLevelPropertyCount; ++i) {
-                    LPWSTR propName = (LPWSTR)((PBYTE)pInfo + pInfo->EventPropertyInfoArray[i].NameOffset);
-                    if (_wcsicmp(propName, L"FileName") == 0 || _wcsicmp(propName, L"OpenPath") == 0) {
-                        PROPERTY_DATA_DESCRIPTOR desc = { 0 };
-                        desc.PropertyName = (ULONGLONG)propName;
-                        desc.ArrayIndex = ULONG_MAX;
-
-                        DWORD propSize = 0;
-                        TdhGetPropertySize(pEventRecord, 0, NULL, 1, &desc, &propSize);
-                        if (propSize > 0) {
-                            std::vector<BYTE> propVal(propSize + 2, 0);
-                            if (TdhGetProperty(pEventRecord, 0, NULL, 1, &desc, propSize, propVal.data()) == ERROR_SUCCESS) {
-                                std::wstring rawPath = (LPWSTR)propVal.data();
-                                ev.target = util::ResolveNtDevicePath(rawPath);
+    // 1. Check File Events (Microsoft-Windows-Kernel-File)
+    if (isFileProvider) {
+        // Special Case: Event ID 24 (OperationEnd) signals completion of an I/O request (Create/Open)
+        // Correlate with pending IRP regardless of which thread/context completes the IRP
+        if (eventId == 24) {
+            DWORD bufferSize = 0;
+            TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
+            if (bufferSize > 0) {
+                std::vector<BYTE> infoBuffer(bufferSize);
+                auto pInfo = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuffer.data());
+                if (TdhGetEventInformation(pEventRecord, 0, NULL, pInfo, &bufferSize) == ERROR_SUCCESS) {
+                    ULONGLONG irp = 0;
+                    if (GetTdhPropertyPointer(pEventRecord, pInfo, L"Irp", irp) && irp != 0) {
+                        PendingFileOp op;
+                        bool found = false;
+                        {
+                            std::lock_guard<std::mutex> lock(s_instance->m_pendingMutex);
+                            auto it = s_instance->m_pendingCreates.find(irp);
+                            if (it != s_instance->m_pendingCreates.end()) {
+                                op = it->second;
+                                s_instance->m_pendingCreates.erase(it);
+                                found = true;
                             }
                         }
-                        break;
+
+                        if (found) {
+                            uint32_t status = 0;
+                            GetTdhPropertyUInt32(pEventRecord, pInfo, L"Status", status);
+
+                            EtwEvent ev;
+                            ev.pid = op.pid;
+                            ev.tid = op.tid;
+                            ev.timestamp = op.timestamp;
+                            ev.target = op.target;
+                            ev.status = status;
+
+                            if (status == 0xC0000022) { // STATUS_ACCESS_DENIED
+                                ev.type = EtwEventType::FILE_ACCESS_DENIED;
+                                if (s_instance->m_callback) {
+                                    s_instance->m_callback(ev);
+                                }
+                            } else if (status == 0) { // STATUS_SUCCESS
+                                ev.type = EtwEventType::FILE_CREATE;
+                                if (s_instance->m_callback) {
+                                    s_instance->m_callback(ev);
+                                }
+                            }
+                        }
                     }
                 }
             }
+            return;
         }
 
-        if (ev.target.empty()) {
-            ev.target = L"[Unknown File Handle]";
+        // For all other file events, filter by monitored PIDs
+        {
+            std::lock_guard<std::mutex> lock(s_instance->m_pidMutex);
+            if (s_instance->m_targetPids.empty() || s_instance->m_targetPids.find(pid) == s_instance->m_targetPids.end()) {
+                return;
+            }
         }
 
-        if (s_instance->m_callback) {
-            s_instance->m_callback(ev);
+        // Event ID 12 (Create) or 30 (CreateNewFile): register pending IRP
+        if (eventId == 12 || eventId == 30) {
+            DWORD bufferSize = 0;
+            TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
+            if (bufferSize > 0) {
+                std::vector<BYTE> infoBuffer(bufferSize);
+                auto pInfo = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuffer.data());
+                if (TdhGetEventInformation(pEventRecord, 0, NULL, pInfo, &bufferSize) == ERROR_SUCCESS) {
+                    ULONGLONG irp = 0;
+                    std::wstring rawName;
+                    GetTdhPropertyPointer(pEventRecord, pInfo, L"Irp", irp);
+                    GetTdhPropertyString(pEventRecord, pInfo, L"FileName", rawName);
+
+                    if (irp != 0 && !rawName.empty()) {
+                        std::wstring dosPath = util::ResolveNtDevicePath(rawName);
+                        std::lock_guard<std::mutex> lock(s_instance->m_pendingMutex);
+                        if (s_instance->m_pendingCreates.size() > 5000) {
+                            s_instance->m_pendingCreates.clear();
+                        }
+                        s_instance->m_pendingCreates[irp] = { pid, pEventRecord->EventHeader.ThreadId, dosPath, util::GetCurrentTimeString() };
+                    }
+                }
+            }
+            return;
         }
+
+        // Event ID 26 (DeletePath)
+        if (eventId == 26) {
+            DWORD bufferSize = 0;
+            TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
+            if (bufferSize > 0) {
+                std::vector<BYTE> infoBuffer(bufferSize);
+                auto pInfo = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuffer.data());
+                if (TdhGetEventInformation(pEventRecord, 0, NULL, pInfo, &bufferSize) == ERROR_SUCCESS) {
+                    std::wstring rawPath;
+                    if (GetTdhPropertyString(pEventRecord, pInfo, L"FilePath", rawPath)) {
+                        EtwEvent ev;
+                        ev.pid = pid;
+                        ev.tid = pEventRecord->EventHeader.ThreadId;
+                        ev.timestamp = util::GetCurrentTimeString();
+                        ev.type = EtwEventType::FILE_DELETE;
+                        ev.target = util::ResolveNtDevicePath(rawPath);
+                        if (s_instance->m_callback) {
+                            s_instance->m_callback(ev);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Event ID 27 (RenamePath)
+        if (eventId == 27) {
+            DWORD bufferSize = 0;
+            TdhGetEventInformation(pEventRecord, 0, NULL, NULL, &bufferSize);
+            if (bufferSize > 0) {
+                std::vector<BYTE> infoBuffer(bufferSize);
+                auto pInfo = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuffer.data());
+                if (TdhGetEventInformation(pEventRecord, 0, NULL, pInfo, &bufferSize) == ERROR_SUCCESS) {
+                    std::wstring rawPath;
+                    if (GetTdhPropertyString(pEventRecord, pInfo, L"FilePath", rawPath)) {
+                        EtwEvent ev;
+                        ev.pid = pid;
+                        ev.tid = pEventRecord->EventHeader.ThreadId;
+                        ev.timestamp = util::GetCurrentTimeString();
+                        ev.type = EtwEventType::FILE_RENAME;
+                        ev.target = util::ResolveNtDevicePath(rawPath);
+                        if (s_instance->m_callback) {
+                            s_instance->m_callback(ev);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         return;
+    }
+
+    // Check if pid is monitored for Network I/O
+    {
+        std::lock_guard<std::mutex> lock(s_instance->m_pidMutex);
+        if (s_instance->m_targetPids.empty() || s_instance->m_targetPids.find(pid) == s_instance->m_targetPids.end()) {
+            return;
+        }
     }
 
     // 2. Check Network Events
     if (IsEqualGUID(providerId, KernelNetworkProviderGuid)) {
+        EtwEvent ev;
+        ev.pid = pid;
+        ev.tid = pEventRecord->EventHeader.ThreadId;
+        ev.timestamp = util::GetCurrentTimeString();
+
         UCHAR opcode = pEventRecord->EventHeader.EventDescriptor.Opcode;
         if (opcode == 10 || opcode == 12) {
             ev.type = EtwEventType::TCP_CONNECT;

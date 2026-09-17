@@ -30,10 +30,20 @@ static core::EtwWatcher* g_pEtw = nullptr;
 static core::NetworkTracker* g_pNetTracker = nullptr;
 static core::FolderWatcher* g_pFolderWatcher = nullptr;
 
+// Global protected paths tracking for Clean Exit restoration
+static std::vector<std::wstring> g_appliedProtectedPaths;
+static std::wstring g_protectedGameDir;
+static bool g_restoreOnExit = true;
+
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
         std::cout << "\n[*] Shutting down MCGuard cleanly...\n";
         g_exitRequested = true;
+        if (g_restoreOnExit && !g_appliedProtectedPaths.empty()) {
+            std::cout << "[*] Restoring protected paths to default Windows integrity level...\n";
+            core::SandboxLauncher::RestoreProtectedPaths(g_appliedProtectedPaths, g_protectedGameDir);
+            g_appliedProtectedPaths.clear();
+        }
         if (g_pWfp) g_pWfp->Shutdown();
         if (g_pEtw) g_pEtw->Stop();
         if (g_pNetTracker) g_pNetTracker->StopPolling();
@@ -373,16 +383,31 @@ int main(int argc, char* argv[]) {
         std::wstring evtPipeName = L"\\\\.\\pipe\\MCGuard_WFP_Evt_" + std::to_wstring(parentPid);
         HANDLE hEvtPipe = CreateFileW(evtPipeName.c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 
+        core::EtwWatcher etwService;
+        std::mutex evtPipeMutex;
+
         if (hEvtPipe != INVALID_HANDLE_VALUE) {
-            wfpService.SetDropCallback([hEvtPipe](const std::string& remoteIp, uint16_t remotePort) {
+            wfpService.SetDropCallback([hEvtPipe, &evtPipeMutex](const std::string& remoteIp, uint16_t remotePort) {
                 std::string line = "DROP " + remoteIp + " " + std::to_string(remotePort) + "\n";
+                std::lock_guard<std::mutex> lock(evtPipeMutex);
                 DWORD written = 0;
                 WriteFile(hEvtPipe, line.c_str(), (DWORD)line.size(), &written, NULL);
+            });
+
+            etwService.Start([hEvtPipe, &evtPipeMutex](const core::EtwEvent& ev) {
+                if (hEvtPipe == INVALID_HANDLE_VALUE) return;
+                if (ev.type == core::EtwEventType::FILE_ACCESS_DENIED) {
+                    std::string targetUtf8 = util::WideToUtf8(ev.target);
+                    std::string line = "DENIED " + std::to_string(ev.pid) + " " + targetUtf8 + "\n";
+                    std::lock_guard<std::mutex> lock(evtPipeMutex);
+                    DWORD written = 0;
+                    WriteFile(hEvtPipe, line.c_str(), (DWORD)line.size(), &written, NULL);
+                }
             });
         }
 
         if (hCmdPipe != INVALID_HANDLE_VALUE) {
-            std::thread pipeThread([hCmdPipe, &wfpService]() {
+            std::thread pipeThread([hCmdPipe, &wfpService, &etwService]() {
                 char buf[512];
                 DWORD bytesRead = 0;
                 std::string pending;
@@ -402,6 +427,16 @@ int main(int argc, char* argv[]) {
                             r.protocol = "TCP";
                             r.description = "Dynamic Parent Rule";
                             wfpService.AddWhitelistRule(r);
+                        } else if (line.rfind("TARGET_PID ", 0) == 0 || line.rfind("PID ", 0) == 0) {
+                            size_t pfx = (line.rfind("TARGET_PID ", 0) == 0) ? 11 : 4;
+                            std::string pidStr = line.substr(pfx);
+                            while (!pidStr.empty() && (pidStr.back() == '\r' || pidStr.back() == ' ')) pidStr.pop_back();
+                            try {
+                                DWORD targetPid = (DWORD)std::stoul(pidStr);
+                                if (targetPid > 0) {
+                                    etwService.AddTargetPid(targetPid);
+                                }
+                            } catch (...) {}
                         }
                     }
                 }
@@ -417,6 +452,7 @@ int main(int argc, char* argv[]) {
             CloseHandle(hParent);
         }
 
+        etwService.Stop();
         if (hEvtPipe != INVALID_HANDLE_VALUE) {
             CloseHandle(hEvtPipe);
         }
@@ -694,14 +730,33 @@ int main(int argc, char* argv[]) {
         sbOptions.lowIntegrity = cfg.sandbox.lowIntegrity;
         sbOptions.stripPrivileges = cfg.sandbox.stripPrivileges;
         sbOptions.useJobObject = cfg.sandbox.useJobObject;
+        sbOptions.denyUserSid = cfg.sandbox.denyUserSid;
         sbOptions.startSuspended = true;
         sbOptions.gameDir = gameDir;
 
-        // Apply kernel-level No-Read-Up & No-Write-Up (NRNW) Mandatory Label protection
-        if (!cfg.protectedPaths.empty()) {
+        if (sbOptions.denyUserSid) {
+            view.PrintSuccess("Sandbox Architecture: Deny-Only User SID (Kernel Default-Deny on private user profile)");
+            LogLauncherDiag("Sandbox Architecture: Deny-Only User SID Active.");
+            for (const auto& p : cfg.protectedPaths) {
+                if (p.empty()) continue;
+                std::wstring wPath = util::Utf8ToWide(p);
+                wchar_t expBuf[MAX_PATH * 4] = { 0 };
+                ExpandEnvironmentStringsW(wPath.c_str(), expBuf, sizeof(expBuf) / sizeof(expBuf[0]));
+                std::string u8Path = util::WideToUtf8(expBuf);
+                cfg.sensitivePatterns.push_back(u8Path);
+                size_t lastSlash = u8Path.find_last_of("\\/");
+                if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
+                    cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
+                }
+            }
+        } else if (!cfg.protectedPaths.empty()) {
+            // Legacy NRNW tagging mode
             std::vector<std::wstring> appliedPaths;
-            core::SandboxLauncher::ApplyProtectedPaths(cfg.protectedPaths, appliedPaths);
+            core::SandboxLauncher::ApplyProtectedPaths(cfg.protectedPaths, appliedPaths, gameDir);
             sbOptions.protectedPaths = appliedPaths;
+            g_appliedProtectedPaths = appliedPaths;
+            g_protectedGameDir = gameDir;
+            g_restoreOnExit = cfg.sandbox.restoreOnExit;
 
             for (const auto& appPath : appliedPaths) {
                 std::string u8Path = util::WideToUtf8(appPath);
@@ -709,10 +764,14 @@ int main(int argc, char* argv[]) {
                 view.PrintSuccess("Protected Path [NRNW Active]: " + u8Path);
 
                 // Add to sensitivePatterns for ETW detection and alerting
+                DWORD dwAttr = GetFileAttributesW(appPath.c_str());
+                bool isDirectory = (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY));
                 cfg.sensitivePatterns.push_back(u8Path);
-                size_t lastSlash = u8Path.find_last_of("\\/");
-                if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
-                    cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
+                if (!isDirectory) {
+                    size_t lastSlash = u8Path.find_last_of("\\/");
+                    if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
+                        cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
+                    }
                 }
             }
         }
@@ -828,8 +887,18 @@ int main(int argc, char* argv[]) {
 
         LogLauncherDiag("Sandbox launch SUCCESS. Sandboxed PID=" + std::to_string(procInfo.processId));
         view.PrintSuccess("Process created inside Sandbox (PID: " + std::to_string(procInfo.processId) + ")");
-        if (sbOptions.lowIntegrity) {
+        if (procInfo.isLowIntegrity) {
             view.PrintStatus("Integrity Level: LOW (S-1-16-4096) - Write access denied to system/user folders");
+        } else if (sbOptions.lowIntegrity) {
+            view.PrintWarning("Integrity Level: MEDIUM (Low IL fallback occurred! Process NOT restricted to Low IL)");
+        }
+        if (procInfo.privilegesStripped) {
+            view.PrintStatus("Privileges: STRIPPED (DISABLE_MAX_PRIVILEGE)");
+        } else if (sbOptions.stripPrivileges) {
+            view.PrintWarning("Privileges: UNMODIFIED (Privilege stripping fallback occurred)");
+        }
+        if (procInfo.userSidDenied) {
+            view.PrintSuccess("User Profile Access: DEFAULT DENIED (Zero disk SACL tagging, Desktop/Documents blocked)");
         }
         if (sbOptions.blockChildProcesses) {
             view.PrintStatus("Child Process Policy: RESTRICTED - Kernel forbids cmd.exe/powershell creation");
@@ -934,6 +1003,23 @@ int main(int argc, char* argv[]) {
                                 try { port = (uint16_t)std::stoul(rest.substr(sp + 1)); } catch (...) { port = 0; }
                                 correlator.OnNetworkConnection(sandboxedPid, ip, port);
                             }
+                        } else if (line.rfind("DENIED ", 0) == 0) {
+                            std::string rest = line.substr(7);
+                            while (!rest.empty() && (rest.back() == '\r' || rest.back() == ' ')) rest.pop_back();
+                            size_t sp = rest.find(' ');
+                            if (sp != std::string::npos) {
+                                DWORD deniedPid = 0;
+                                try { deniedPid = (DWORD)std::stoul(rest.substr(0, sp)); } catch (...) {}
+                                std::string targetUtf8 = rest.substr(sp + 1);
+                                core::EtwEvent ev;
+                                ev.pid = (deniedPid > 0) ? deniedPid : sandboxedPid;
+                                ev.tid = 0;
+                                ev.timestamp = util::GetCurrentTimeString();
+                                ev.type = core::EtwEventType::FILE_ACCESS_DENIED;
+                                ev.target = util::Utf8ToWide(targetUtf8);
+                                ev.status = 0xC0000022; // STATUS_ACCESS_DENIED
+                                correlator.OnEtwEvent(ev);
+                            }
                         }
                     }
                 }
@@ -1018,7 +1104,42 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Resume sandboxed process thread
+        // 8. Start File / Directory Watcher on Minecraft game directory
+        core::FolderWatcher folderWatcher;
+        g_pFolderWatcher = &folderWatcher;
+        std::wstring watchDir = gameDir;
+        if (watchDir.empty()) {
+            wchar_t appData[MAX_PATH];
+            if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) {
+                watchDir = std::wstring(appData) + L"\\.minecraft";
+            }
+        }
+        if (!watchDir.empty()) {
+            folderWatcher.StartWatching(watchDir, procInfo.processId, [&correlator](const core::FileChangeEvent& ev) {
+                std::string opStr = "FILE_WRITE";
+                if (ev.opType == core::FileOpType::OP_CREATE) opStr = "FILE_CREATE";
+                else if (ev.opType == core::FileOpType::OP_DELETE) opStr = "FILE_DELETE";
+                correlator.OnFolderEvent(ev.pid, ev.filePath, opStr);
+            });
+            view.PrintStatus("Active Directory Watcher monitoring: " + util::WideToUtf8(watchDir));
+        }
+
+        // 9. Start ETW Kernel Watcher (direct if elevated, or via elevated helper)
+        core::EtwWatcher etw;
+        g_pEtw = &etw;
+        if (isElevated) {
+            etw.Start([&correlator](const core::EtwEvent& ev) {
+                correlator.OnEtwEvent(ev);
+            });
+            etw.AddTargetPid(procInfo.processId);
+        } else if (hWfpPipe != INVALID_HANDLE_VALUE) {
+            std::string pidMsg = "TARGET_PID " + std::to_string(procInfo.processId) + "\n";
+            DWORD written = 0;
+            WriteFile(hWfpPipe, pidMsg.c_str(), (DWORD)pidMsg.size(), &written, NULL);
+            Sleep(50);
+        }
+
+        // Resume sandboxed process thread now that watchers are fully armed
         core::SandboxLauncher::ResumeSandboxedProcess(procInfo);
         view.PrintSuccess("Sandboxed Minecraft is now running safely!\n");
         view.PrintStatus("Audit Log File: " + view.GetLogFilePath() + "\n");
@@ -1043,36 +1164,6 @@ int main(int argc, char* argv[]) {
         sbRec.source = "Sandbox Mitigation";
         sbRec.details = "Job Object ActiveProcessLimit=1, Token Privileges Stripped";
         correlator.PostAuditRecord(sbRec);
-
-        // 8. Start File / Directory Watcher on Minecraft game directory
-        core::FolderWatcher folderWatcher;
-        g_pFolderWatcher = &folderWatcher;
-        std::wstring watchDir = gameDir;
-        if (watchDir.empty()) {
-            wchar_t appData[MAX_PATH];
-            if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) {
-                watchDir = std::wstring(appData) + L"\\.minecraft";
-            }
-        }
-        if (!watchDir.empty()) {
-            folderWatcher.StartWatching(watchDir, procInfo.processId, [&correlator](const core::FileChangeEvent& ev) {
-                std::string opStr = "FILE_WRITE";
-                if (ev.opType == core::FileOpType::OP_CREATE) opStr = "FILE_CREATE";
-                else if (ev.opType == core::FileOpType::OP_DELETE) opStr = "FILE_DELETE";
-                correlator.OnFolderEvent(ev.pid, ev.filePath, opStr);
-            });
-            view.PrintStatus("Active Directory Watcher monitoring: " + util::WideToUtf8(watchDir));
-        }
-
-        // 9. Start ETW & Network tracking
-        core::EtwWatcher etw;
-        g_pEtw = &etw;
-        if (isElevated) {
-            etw.Start([&correlator](const core::EtwEvent& ev) {
-                correlator.OnEtwEvent(ev);
-            });
-            etw.AddTargetPid(procInfo.processId);
-        }
 
         core::NetworkTracker netTracker;
         g_pNetTracker = &netTracker;
@@ -1128,6 +1219,14 @@ int main(int argc, char* argv[]) {
         if (stderrForwarder.joinable()) stderrForwarder.join();
 
         core::SandboxLauncher::CleanupProcessInfo(procInfo);
+
+        if (!sbOptions.denyUserSid && cfg.sandbox.restoreOnExit && !sbOptions.protectedPaths.empty()) {
+            view.PrintStatus("Restoring protected paths to default Windows integrity level (Clean Exit)...");
+            core::SandboxLauncher::RestoreProtectedPaths(sbOptions.protectedPaths, gameDir);
+            view.PrintSuccess("Protected paths restored cleanly.");
+            g_appliedProtectedPaths.clear();
+        }
+
         view.PrintSuccess("MCGuard Sandbox session ended cleanly.");
         return (int)sandboxedExitCode;
     }
