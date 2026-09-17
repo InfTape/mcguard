@@ -112,6 +112,17 @@ bool WfpGuard::ProtectApplication(const std::wstring& appPath, const std::vector
     loopbackRule.protocol = "ANY";
     AddPermitRule(loopbackRule, permitWeight + 1);
 
+    // 3. Subscribe to Net Events (Classification Drops)
+    if (m_netEventSubHandle) {
+        FwpmNetEventUnsubscribe0(m_engineHandle, m_netEventSubHandle);
+        m_netEventSubHandle = NULL;
+    }
+    FWPM_NET_EVENT_SUBSCRIPTION0 sub = { 0 };
+    DWORD subRes = FwpmNetEventSubscribe0(m_engineHandle, &sub, &WfpGuard::NetEventCallback, this, &m_netEventSubHandle);
+    if (subRes != ERROR_SUCCESS) {
+        m_netEventSubHandle = NULL;
+    }
+
     m_isProtecting = true;
     return true;
 }
@@ -252,6 +263,11 @@ bool WfpGuard::AddWhitelistRule(const WhitelistRule& rule) {
 void WfpGuard::RemoveInstalledFilters() {
     if (!m_engineHandle) return;
 
+    if (m_netEventSubHandle) {
+        FwpmNetEventUnsubscribe0(m_engineHandle, m_netEventSubHandle);
+        m_netEventSubHandle = NULL;
+    }
+
     for (UINT64 filterId : m_installedFilterIds) {
         FwpmFilterDeleteById0(m_engineHandle, filterId);
     }
@@ -280,6 +296,50 @@ void WfpGuard::Shutdown() {
         FwpmSubLayerDeleteByKey0(m_engineHandle, &m_subLayerKey);
         FwpmEngineClose0(m_engineHandle);
         m_engineHandle = NULL;
+    }
+}
+
+void CALLBACK WfpGuard::NetEventCallback(void* context, const FWPM_NET_EVENT1* event) {
+    if (!context || !event) return;
+    auto pThis = reinterpret_cast<WfpGuard*>(context);
+
+    if (event->type == FWPM_NET_EVENT_TYPE_CLASSIFY_DROP) {
+        bool isOurDrop = false;
+        if (event->classifyDrop) {
+            std::lock_guard<std::mutex> lock(pThis->m_mutex);
+            for (UINT64 fId : pThis->m_installedFilterIds) {
+                if (event->classifyDrop->filterId == fId) {
+                    isOurDrop = true;
+                    break;
+                }
+            }
+        }
+        if (!isOurDrop && pThis->m_appId && event->header.appId.size == pThis->m_appId->size &&
+            memcmp(event->header.appId.data, pThis->m_appId->data, pThis->m_appId->size) == 0) {
+            isOurDrop = true;
+        }
+
+        if (isOurDrop && event->header.ipVersion == FWP_IP_VERSION_V4) {
+            uint32_t netIp = htonl(event->header.remoteAddrV4);
+            std::string remoteIp = util::Ipv4ToString(netIp);
+            uint16_t remotePort = event->header.remotePort;
+
+            // Deduplicate drops for the same target within 1000ms
+            std::string key = remoteIp + ":" + std::to_string(remotePort);
+            uint64_t nowMs = GetTickCount64();
+            {
+                std::lock_guard<std::mutex> lock(pThis->m_dropDedupeMutex);
+                auto it = pThis->m_lastDropTimeMs.find(key);
+                if (it != pThis->m_lastDropTimeMs.end() && (nowMs - it->second) < 1000) {
+                    return;
+                }
+                pThis->m_lastDropTimeMs[key] = nowMs;
+            }
+
+            if (pThis->m_dropCallback) {
+                pThis->m_dropCallback(remoteIp, remotePort);
+            }
+        }
     }
 }
 

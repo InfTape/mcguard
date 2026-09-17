@@ -5,6 +5,8 @@
 #include <vector>
 #include <mutex>
 #include <cstdint>
+#include <functional>
+#include <map>
 
 namespace mcguard {
 namespace core {
@@ -18,6 +20,8 @@ struct WhitelistRule {
 
 class WfpGuard {
 public:
+    using DropCallback = std::function<void(const std::string& remoteIp, uint16_t remotePort)>;
+
     WfpGuard();
     ~WfpGuard();
 
@@ -26,6 +30,9 @@ public:
 
     // Attach WFP ALE rules to a specific application executable path (e.g. javaw.exe)
     bool ProtectApplication(const std::wstring& appPath, const std::vector<WhitelistRule>& whitelist);
+
+    // Set callback for kernel ALE packet drops (FwpmNetEventSubscribe)
+    void SetDropCallback(DropCallback cb) { m_dropCallback = cb; }
 
     // Add a single runtime whitelist rule for the protected application
     bool AddWhitelistRule(const WhitelistRule& rule);
@@ -48,13 +55,20 @@ private:
     bool AddDefaultBlockRule(uint8_t weight);
     void RemoveInstalledFilters();
 
+    static void CALLBACK NetEventCallback(void* context, const FWPM_NET_EVENT1* event);
+
     HANDLE m_engineHandle = NULL;
+    HANDLE m_netEventSubHandle = NULL;
     GUID m_subLayerKey = { 0 };
     FWP_BYTE_BLOB* m_appId = NULL;
     std::wstring m_protectedAppPath;
     std::vector<UINT64> m_installedFilterIds;
     std::mutex m_mutex;
     bool m_isProtecting = false;
+
+    DropCallback m_dropCallback;
+    std::mutex m_dropDedupeMutex;
+    std::map<std::string, uint64_t> m_lastDropTimeMs;
 };
 
 } // namespace core

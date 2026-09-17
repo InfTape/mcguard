@@ -364,15 +364,27 @@ int main(int argc, char* argv[]) {
             CloseHandle(hEvent);
         }
 
-        // Connect to named pipe for dynamic updates
-        std::wstring pipeName = L"\\\\.\\pipe\\MCGuard_WFP_" + std::to_wstring(parentPid);
-        HANDLE hPipe = CreateFileW(pipeName.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
-        if (hPipe != INVALID_HANDLE_VALUE) {
-            std::thread pipeThread([hPipe, &wfpService]() {
+        // Connect to named pipes for dynamic updates & drop event reporting
+        std::wstring cmdPipeName = L"\\\\.\\pipe\\MCGuard_WFP_Cmd_" + std::to_wstring(parentPid);
+        HANDLE hCmdPipe = CreateFileW(cmdPipeName.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+
+        std::wstring evtPipeName = L"\\\\.\\pipe\\MCGuard_WFP_Evt_" + std::to_wstring(parentPid);
+        HANDLE hEvtPipe = CreateFileW(evtPipeName.c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+
+        if (hEvtPipe != INVALID_HANDLE_VALUE) {
+            wfpService.SetDropCallback([hEvtPipe](const std::string& remoteIp, uint16_t remotePort) {
+                std::string line = "DROP " + remoteIp + " " + std::to_string(remotePort) + "\n";
+                DWORD written = 0;
+                WriteFile(hEvtPipe, line.c_str(), (DWORD)line.size(), &written, NULL);
+            });
+        }
+
+        if (hCmdPipe != INVALID_HANDLE_VALUE) {
+            std::thread pipeThread([hCmdPipe, &wfpService]() {
                 char buf[512];
                 DWORD bytesRead = 0;
                 std::string pending;
-                while (ReadFile(hPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                while (ReadFile(hCmdPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
                     buf[bytesRead] = '\0';
                     pending += buf;
                     size_t nl;
@@ -391,7 +403,7 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
-                CloseHandle(hPipe);
+                CloseHandle(hCmdPipe);
             });
             pipeThread.detach();
         }
@@ -401,6 +413,10 @@ int main(int argc, char* argv[]) {
         if (hParent) {
             WaitForSingleObject(hParent, INFINITE);
             CloseHandle(hParent);
+        }
+
+        if (hEvtPipe != INVALID_HANDLE_VALUE) {
+            CloseHandle(hEvtPipe);
         }
 
         wfpService.Shutdown();
@@ -673,6 +689,7 @@ int main(int argc, char* argv[]) {
         bool wfpActive = false;
         HANDLE hWfpHelperProcess = NULL;
         HANDLE hWfpPipe = INVALID_HANDLE_VALUE;
+        HANDLE hPipeEvtServer = INVALID_HANDLE_VALUE;
 
         if (isElevated) {
             if (wfp.Initialize()) {
@@ -687,18 +704,32 @@ int main(int argc, char* argv[]) {
             std::wstring eventName = L"Local\\MCGuard_WFP_Ready_" + std::to_wstring(myPid);
             HANDLE hReadyEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
 
-            std::wstring pipeName = L"\\\\.\\pipe\\MCGuard_WFP_" + std::to_wstring(myPid);
-            HANDLE hPipeServer = CreateNamedPipeW(
-                pipeName.c_str(),
+            std::wstring cmdPipeName = L"\\\\.\\pipe\\MCGuard_WFP_Cmd_" + std::to_wstring(myPid);
+            HANDLE hPipeCmdServer = CreateNamedPipeW(
+                cmdPipeName.c_str(),
                 PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1, 4096, 4096, 0, NULL
             );
 
-            OVERLAPPED ovPipe = { 0 };
-            ovPipe.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-            if (hPipeServer != INVALID_HANDLE_VALUE) {
-                ConnectNamedPipe(hPipeServer, &ovPipe);
+            std::wstring evtPipeName = L"\\\\.\\pipe\\MCGuard_WFP_Evt_" + std::to_wstring(myPid);
+            hPipeEvtServer = CreateNamedPipeW(
+                evtPipeName.c_str(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1, 4096, 4096, 0, NULL
+            );
+
+            OVERLAPPED ovCmd = { 0 };
+            ovCmd.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (hPipeCmdServer != INVALID_HANDLE_VALUE) {
+                ConnectNamedPipe(hPipeCmdServer, &ovCmd);
+            }
+
+            OVERLAPPED ovEvt = { 0 };
+            ovEvt.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (hPipeEvtServer != INVALID_HANDLE_VALUE) {
+                ConnectNamedPipe(hPipeEvtServer, &ovEvt);
             }
 
             wchar_t currentExe[MAX_PATH];
@@ -720,7 +751,7 @@ int main(int argc, char* argv[]) {
 
                 if (hReadyEvent && WaitForSingleObject(hReadyEvent, 5000) == WAIT_OBJECT_0) {
                     wfpActive = true;
-                    hWfpPipe = hPipeServer;
+                    hWfpPipe = hPipeCmdServer;
                     LogLauncherDiag("Elevated WFP ALE Engine successfully activated and armed!");
                 } else {
                     LogLauncherDiag("Elevated WFP service timed out waiting for ready signal.");
@@ -732,12 +763,17 @@ int main(int argc, char* argv[]) {
                 } else {
                     LogLauncherDiag("ShellExecuteExW failed: error " + std::to_string(uacErr));
                 }
-                if (hPipeServer != INVALID_HANDLE_VALUE) {
-                    CloseHandle(hPipeServer);
+                if (hPipeCmdServer != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hPipeCmdServer);
+                }
+                if (hPipeEvtServer != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hPipeEvtServer);
+                    hPipeEvtServer = INVALID_HANDLE_VALUE;
                 }
             }
 
-            if (ovPipe.hEvent) CloseHandle(ovPipe.hEvent);
+            if (ovCmd.hEvent) CloseHandle(ovCmd.hEvent);
+            if (ovEvt.hEvent) CloseHandle(ovEvt.hEvent);
             if (hReadyEvent) CloseHandle(hReadyEvent);
         }
 
@@ -786,6 +822,59 @@ int main(int argc, char* argv[]) {
         correlator.SetAuditCallback([&view](const core::AuditRecord& rec) {
             view.DisplayRecord(rec);
         });
+
+        // Register drop listeners to capture real kernel drops!
+        DWORD sandboxedPid = procInfo.processId;
+        if (isElevated && wfp.IsActive()) {
+            wfp.SetDropCallback([&correlator, sandboxedPid](const std::string& remoteIp, uint16_t remotePort) {
+                correlator.OnNetworkConnection(sandboxedPid, remoteIp, remotePort);
+            });
+        } else if (wfpActive && hPipeEvtServer != INVALID_HANDLE_VALUE) {
+            HANDLE hEvtToRead = hPipeEvtServer;
+            std::thread evtThread([hEvtToRead, &correlator, sandboxedPid]() {
+                OVERLAPPED ovRead = { 0 };
+                ovRead.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+                char buf[512];
+                std::string pending;
+
+                while (!g_exitRequested) {
+                    ResetEvent(ovRead.hEvent);
+                    DWORD bytesRead = 0;
+                    BOOL ok = ReadFile(hEvtToRead, buf, sizeof(buf) - 1, &bytesRead, &ovRead);
+                    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                        if (GetOverlappedResult(hEvtToRead, &ovRead, &bytesRead, TRUE) && bytesRead > 0) {
+                            ok = TRUE;
+                        } else {
+                            break;
+                        }
+                    } else if (!ok || bytesRead == 0) {
+                        break;
+                    }
+
+                    buf[bytesRead] = '\0';
+                    pending += buf;
+                    size_t nl;
+                    while ((nl = pending.find('\n')) != std::string::npos) {
+                        std::string line = pending.substr(0, nl);
+                        pending.erase(0, nl + 1);
+                        if (line.rfind("DROP ", 0) == 0) {
+                            std::string rest = line.substr(5);
+                            while (!rest.empty() && (rest.back() == '\r' || rest.back() == ' ')) rest.pop_back();
+                            size_t sp = rest.find(' ');
+                            if (sp != std::string::npos) {
+                                std::string ip = rest.substr(0, sp);
+                                uint16_t port = 0;
+                                try { port = (uint16_t)std::stoul(rest.substr(sp + 1)); } catch (...) { port = 0; }
+                                correlator.OnNetworkConnection(sandboxedPid, ip, port);
+                            }
+                        }
+                    }
+                }
+                if (ovRead.hEvent) CloseHandle(ovRead.hEvent);
+                CloseHandle(hEvtToRead);
+            });
+            evtThread.detach();
+        }
 
         // Configure DnsTracker with domain suffixes and dynamic WFP whitelisting callback
         auto& dnsTracker = core::DnsTracker::Instance();
