@@ -467,6 +467,10 @@ int main(int argc, char* argv[]) {
                     if (!line.empty()) {
                         core::AuditRecord rec;
                         if (ui::ConsoleView::ParseJsonRecord(line, rec)) {
+                            // Only display records belonging to the current target Minecraft process
+                            if (targetPid != 0 && rec.pid != targetPid) {
+                                continue;
+                            }
                             monView.DisplayRecord(rec, false /* do not re-write to file */);
                             totalRecords++;
                         }
