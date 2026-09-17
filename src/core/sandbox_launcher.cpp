@@ -111,8 +111,11 @@ bool SandboxLauncher::GrantFullAccessToFolder(const std::wstring& folderPath) {
                     PACCESS_ALLOWED_ACE pAllowedAce = (PACCESS_ALLOWED_ACE)pAce;
                     PSID pSid = (PSID)&pAllowedAce->SidStart;
                     if (EqualSid(pSid, pUsersSid)) {
-                        if ((pAllowedAce->Mask & GENERIC_ALL) == GENERIC_ALL || 
-                            (pAllowedAce->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS) {
+                        bool hasFullControl = ((pAllowedAce->Mask & GENERIC_ALL) == GENERIC_ALL || 
+                                               (pAllowedAce->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS);
+                        bool hasInheritance = ((pHeader->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) == 
+                                               (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE));
+                        if (hasFullControl && hasInheritance) {
                             LocalFree(pUsersSid);
                             LocalFree(pSD);
                             return true;
@@ -333,14 +336,13 @@ void SandboxLauncher::GrantAncestorsTraverseAccess(const std::wstring& targetPat
 bool SandboxLauncher::GrantLowIntegrityAccessToFolder(const std::wstring& folderPath) {
     if (folderPath.empty()) return false;
 
-    // S:(ML;OICI;NW;;;LW)
-    // ML = Mandatory Label
-    // OICI = Object Inherit + Container Inherit
-    // NW = No-Write-Up (allows Low Integrity processes to write)
-    // LW = Low Mandatory Level (S-1-16-4096)
+    DWORD attr = GetFileAttributesW(folderPath.c_str());
+    bool isDir = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+    const wchar_t* sddl = isDir ? L"S:(ML;OICI;NW;;;LW)" : L"S:(ML;;NW;;;LW)";
+
     PSECURITY_DESCRIPTOR pSD = NULL;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"S:(ML;OICI;NW;;;LW)",
+            sddl,
             SDDL_REVISION_1,
             &pSD,
             NULL)) {
@@ -573,8 +575,8 @@ void SandboxLauncher::RestoreProtectedPaths(const std::vector<std::wstring>& pat
     }
 }
 
-static void GrantSubdirectoriesAccess(const std::wstring& rootDir) {
-    if (rootDir.empty()) return;
+static void GrantSubdirectoriesAccess(const std::wstring& rootDir, int maxDepth = 5) {
+    if (rootDir.empty() || maxDepth <= 0) return;
     std::wstring searchPattern = rootDir;
     if (searchPattern.back() != L'\\') searchPattern += L'\\';
     searchPattern += L"*";
@@ -584,12 +586,27 @@ static void GrantSubdirectoriesAccess(const std::wstring& rootDir) {
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            std::wstring itemPath = rootDir;
+            if (itemPath.back() != L'\\') itemPath += L'\\';
+            itemPath += fd.cFileName;
+
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                std::wstring subPath = rootDir;
-                if (subPath.back() != L'\\') subPath += L'\\';
-                subPath += fd.cFileName;
-                SandboxLauncher::GrantFullAccessToFolder(subPath);
-                SandboxLauncher::GrantLowIntegrityAccessToFolder(subPath);
+                SandboxLauncher::GrantFullAccessToFolder(itemPath);
+                SandboxLauncher::GrantLowIntegrityAccessToFolder(itemPath);
+
+                std::wstring nameLower = fd.cFileName;
+                for (auto& ch : nameLower) ch = towlower(ch);
+                if (nameLower != L"libraries" && nameLower != L"assets") {
+                    GrantSubdirectoriesAccess(itemPath, maxDepth - 1);
+                }
+            } else {
+                std::wstring fileName = fd.cFileName;
+                if (fileName.length() >= 4 && fileName.rfind(L".tmp") == fileName.length() - 4) {
+                    SetFileAttributesW(itemPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+                    DeleteFileW(itemPath.c_str());
+                } else {
+                    SandboxLauncher::GrantLowIntegrityAccessToFolder(itemPath);
+                }
             }
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
@@ -649,8 +666,16 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         grantDirAccess(mcRoot);
     }
     if (!mcRoot.empty()) {
+        // Pre-create .fabric directory if it does not exist so it is properly initialized
+        std::wstring fabricDir = mcRoot;
+        if (fabricDir.back() != L'\\') fabricDir += L'\\';
+        fabricDir += L".fabric";
+        CreateDirectoryW(fabricDir.c_str(), NULL);
+        grantDirAccess(fabricDir);
+
         static const std::vector<std::wstring> s_mcSubDirs = {
-            L"libraries", L"assets", L"versions", L"mods", L"config"
+            L"libraries", L"assets", L"versions", L"mods", L"config",
+            L".fabric", L"logs", L"saves", L".mixin.out"
         };
         for (const auto& sub : s_mcSubDirs) {
             std::wstring subPath = mcRoot;
