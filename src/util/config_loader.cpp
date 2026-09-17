@@ -347,6 +347,25 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         }
     }
 
+    // Parse auto_close settings
+    std::string autoCloseStr = FindJsonFieldValue(configContent, "auto_close_on_exit");
+    if (autoCloseStr.empty()) {
+        autoCloseStr = FindJsonFieldValue(configContent, "auto_close");
+    }
+    if (!autoCloseStr.empty()) {
+        outConfig.autoCloseOnExit = (autoCloseStr == "true");
+    }
+
+    std::string autoCloseDelayStr = FindJsonFieldValue(configContent, "auto_close_delay");
+    if (autoCloseDelayStr.empty()) {
+        autoCloseDelayStr = FindJsonFieldValue(configContent, "auto_close_delay_seconds");
+    }
+    if (!autoCloseDelayStr.empty()) {
+        try {
+            outConfig.autoCloseDelaySeconds = std::stoi(autoCloseDelayStr);
+        } catch (...) {}
+    }
+
     return true;
 }
 

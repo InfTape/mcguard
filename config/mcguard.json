@@ -67,7 +67,9 @@
   "logging": {
     "jsonl_output": "mcguard_audit.jsonl",
     "console_output": true,
-    "verbose": false
+    "verbose": false,
+    "auto_close_on_exit": false,
+    "auto_close_delay": 5
   },
   "sandbox": {
     "enabled": true,

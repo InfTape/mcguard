@@ -219,6 +219,8 @@ int main(int argc, char* argv[]) {
                         auditFilePath = argv[++m];
                     } else if (mArg == "--wfp" && m + 1 < argc) {
                         monitorWfpActive = (std::string(argv[++m]) == "1");
+                    } else if (mArg == "--auto-close" && m + 1 < argc) {
+                        cfg.autoCloseOnExit = (std::string(argv[++m]) == "1");
                     }
                 }
                 break;
@@ -501,14 +503,22 @@ int main(int argc, char* argv[]) {
 
                     monView.PrintSuccess("Minecraft Process (PID: " + std::to_string(targetPid) + ") has terminated.");
                     monView.PrintStatus("Session summary: " + std::to_string(totalRecords) + " total security events recorded.");
-                    monView.PrintStatus("Window will close automatically in 5 seconds (or press any key)...");
 
-                    for (int s = 0; s < 50; ++s) {
-                        if (_kbhit()) {
-                            _getch();
-                            break;
+                    if (cfg.autoCloseOnExit) {
+                        int delay = (cfg.autoCloseDelaySeconds >= 0) ? cfg.autoCloseDelaySeconds : 5;
+                        if (delay > 0) {
+                            monView.PrintStatus("Window will close automatically in " + std::to_string(delay) + " seconds (or press any key)...");
+                            for (int s = 0; s < delay * 10; ++s) {
+                                if (_kbhit()) {
+                                    _getch();
+                                    break;
+                                }
+                                Sleep(100);
+                            }
                         }
-                        Sleep(100);
+                    } else {
+                        monView.PrintStatus("Session finished. Press any key to close this window (or close directly)...");
+                        _getch();
                     }
                     break;
                 }
@@ -943,7 +953,8 @@ int main(int argc, char* argv[]) {
             std::wstring monCmd = L"\"" + std::wstring(exePath) + L"\" monitor --pid " +
                                   std::to_wstring(procInfo.processId) + L" --audit \"" +
                                   util::Utf8ToWide(view.GetLogFilePath()) + L"\" --wfp " +
-                                  (wfpActive ? L"1" : L"0");
+                                  (wfpActive ? L"1" : L"0") + L" --auto-close " +
+                                  (cfg.autoCloseOnExit ? L"1" : L"0");
             std::vector<wchar_t> monCmdBuf(monCmd.begin(), monCmd.end());
             monCmdBuf.push_back(L'\0');
 

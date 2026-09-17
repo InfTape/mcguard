@@ -26,6 +26,8 @@ struct ConfigData {
     bool allowLan = true;
     bool allowDns = true;
     bool autoWhitelistGameDir = true;
+    bool autoCloseOnExit = false;
+    int autoCloseDelaySeconds = 5;
     SandboxConfig sandbox;
 };
 

@@ -100,6 +100,14 @@
         },
         "verbose": {
           "type": "boolean"
+        },
+        "auto_close_on_exit": {
+          "type": "boolean",
+          "description": "Automatically close the monitor console window after Minecraft process terminates (defaults to false)"
+        },
+        "auto_close_delay": {
+          "type": "integer",
+          "description": "Delay in seconds before closing the console when auto_close_on_exit is enabled (default: 5)"
         }
       }
     },
