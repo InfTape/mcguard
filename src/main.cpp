@@ -1087,29 +1087,6 @@ int main(int argc, char* argv[]) {
             correlator.OnModuleLoaded(procInfo.processId, m);
         }
 
-        // Window detection callback for HMCL readiness sync
-        struct WindowCheckData {
-            DWORD targetPid;
-            HWND foundWnd;
-        };
-        auto EnumWindowsCallback = [](HWND hWnd, LPARAM lParam) -> BOOL {
-            WindowCheckData* data = reinterpret_cast<WindowCheckData*>(lParam);
-            DWORD pid = 0;
-            GetWindowThreadProcessId(hWnd, &pid);
-            if (pid == data->targetPid && IsWindowVisible(hWnd)) {
-                RECT rc;
-                if (GetWindowRect(hWnd, &rc)) {
-                    if ((rc.right - rc.left) > 120 && (rc.bottom - rc.top) > 120) {
-                        data->foundWnd = hWnd;
-                        return FALSE; // Stop enumeration
-                    }
-                }
-            }
-            return TRUE;
-        };
-
-        bool gameWindowAcknowledged = false;
-        DWORD windowDetectCounter = 0;
         DWORD sandboxedExitCode = 0;
 
         // Loop until process exits or user exits
@@ -1123,26 +1100,6 @@ int main(int argc, char* argv[]) {
             }
 
             loopCounter++;
-
-            // Game window detection safety net:
-            // When game window is established, emit sync line to guarantee launcher dismisses progress bar
-            if (!gameWindowAcknowledged) {
-                WindowCheckData checkData = { procInfo.processId, NULL };
-                EnumWindows(EnumWindowsCallback, reinterpret_cast<LPARAM>(&checkData));
-                if (checkData.foundWnd != NULL) {
-                    windowDetectCounter++;
-                    if (windowDetectCounter >= 4) { // Window stable for 2 seconds
-                        gameWindowAcknowledged = true;
-                        LogLauncherDiag("Minecraft game window confirmed for PID " + std::to_string(procInfo.processId) + ". Emitting readiness sync.");
-                        HANDLE hCallerOut = GetStdHandle(STD_OUTPUT_HANDLE);
-                        if (hCallerOut && hCallerOut != INVALID_HANDLE_VALUE) {
-                            std::string syncMsg = "[MCGuard] Sandboxed Minecraft window ready (LWJGL version synchronized)\r\n";
-                            DWORD written = 0;
-                            WriteFile(hCallerOut, syncMsg.c_str(), (DWORD)syncMsg.size(), &written, NULL);
-                        }
-                    }
-                }
-            }
 
             // Every 3 seconds, check for newly loaded native DLLs
             if (loopCounter % 6 == 0) {
