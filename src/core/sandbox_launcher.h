@@ -24,6 +24,8 @@ struct SandboxProcessInfo {
     DWORD processId = 0;
     DWORD threadId = 0;
     HANDLE hJob = NULL;
+    HANDLE hStdOutRead = NULL;
+    HANDLE hStdErrRead = NULL;
 };
 
 class SandboxLauncher {

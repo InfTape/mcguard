@@ -171,31 +171,69 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         }
     }
 
-    // 2. Prepare ProcThreadAttributeList for Mitigation Policy
+    // 2. Prepare stdout & stderr redirection pipes
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hChildStdOutRead = NULL, hChildStdOutWrite = NULL;
+    HANDLE hChildStdErrRead = NULL, hChildStdErrWrite = NULL;
+
+    bool pipesCreated = false;
+    if (CreatePipe(&hChildStdOutRead, &hChildStdOutWrite, &sa, 0) &&
+        CreatePipe(&hChildStdErrRead, &hChildStdErrWrite, &sa, 0)) {
+        SetHandleInformation(hChildStdOutRead, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hChildStdErrRead, HANDLE_FLAG_INHERIT, 0);
+        pipesCreated = true;
+    }
+
+    // Prepare ProcThreadAttributeList for Mitigation Policy and Handle Inheritance
     STARTUPINFOEXW siex = { 0 };
     siex.StartupInfo.cb = sizeof(siex);
 
     std::vector<BYTE> attrBuffer;
     LPPROC_THREAD_ATTRIBUTE_LIST attrList = NULL;
 
-    if (options.blockChildProcesses) {
+    DWORD attrCount = 0;
+    if (options.blockChildProcesses) attrCount++;
+    if (pipesCreated) attrCount++;
+
+    std::vector<HANDLE> handlesToInherit;
+    if (pipesCreated) {
+        handlesToInherit.push_back(hChildStdOutWrite);
+        handlesToInherit.push_back(hChildStdErrWrite);
+        siex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        siex.StartupInfo.hStdOutput = hChildStdOutWrite;
+        siex.StartupInfo.hStdError = hChildStdErrWrite;
+        siex.StartupInfo.hStdInput = NULL;
+    }
+
+    if (attrCount > 0) {
         SIZE_T attrSize = 0;
-        InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+        InitializeProcThreadAttributeList(NULL, attrCount, 0, &attrSize);
         if (attrSize > 0) {
             attrBuffer.resize(attrSize);
             attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuffer.data();
-            if (InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
-                DWORD policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
-                if (UpdateProcThreadAttribute(
+            if (InitializeProcThreadAttributeList(attrList, attrCount, 0, &attrSize)) {
+                if (options.blockChildProcesses) {
+                    DWORD policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+                    UpdateProcThreadAttribute(
                         attrList,
                         0,
                         PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
                         &policy,
                         sizeof(policy),
                         NULL,
-                        NULL)) {
-                    siex.lpAttributeList = attrList;
+                        NULL);
                 }
+                if (!handlesToInherit.empty()) {
+                    UpdateProcThreadAttribute(
+                        attrList,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                        handlesToInherit.data(),
+                        handlesToInherit.size() * sizeof(HANDLE),
+                        NULL,
+                        NULL);
+                }
+                siex.lpAttributeList = attrList;
             }
         }
     }
@@ -225,7 +263,7 @@ bool SandboxLauncher::LaunchSandboxedProcess(
             cmdLineBuf.data(),
             NULL,
             NULL,
-            FALSE,
+            pipesCreated ? TRUE : FALSE,
             creationFlags,
             NULL,
             NULL,
@@ -245,7 +283,7 @@ bool SandboxLauncher::LaunchSandboxedProcess(
             cmdLineBuf.data(),
             NULL,
             NULL,
-            FALSE,
+            pipesCreated ? TRUE : FALSE,
             creationFlags,
             NULL,
             NULL,
@@ -256,8 +294,22 @@ bool SandboxLauncher::LaunchSandboxedProcess(
             outError = "CreateProcessW failed (code " + std::to_string(GetLastError()) + ")";
             if (attrList) DeleteProcThreadAttributeList(attrList);
             if (hToken) CloseHandle(hToken);
+            if (hChildStdOutWrite) CloseHandle(hChildStdOutWrite);
+            if (hChildStdErrWrite) CloseHandle(hChildStdErrWrite);
+            if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
+            if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
             return false;
         }
+    }
+
+    // Close parent's copies of write handles so EOF unblocks when child terminates
+    if (hChildStdOutWrite) {
+        CloseHandle(hChildStdOutWrite);
+        hChildStdOutWrite = NULL;
+    }
+    if (hChildStdErrWrite) {
+        CloseHandle(hChildStdErrWrite);
+        hChildStdErrWrite = NULL;
     }
 
     if (attrList) {
@@ -271,6 +323,8 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     outInfo.hThread = pi.hThread;
     outInfo.processId = pi.dwProcessId;
     outInfo.threadId = pi.dwThreadId;
+    outInfo.hStdOutRead = hChildStdOutRead;
+    outInfo.hStdErrRead = hChildStdErrRead;
 
     // 5. Assign to Job Object with ActiveProcessLimit = 1
     if (options.useJobObject) {
@@ -308,6 +362,14 @@ void SandboxLauncher::CleanupProcessInfo(SandboxProcessInfo& procInfo) {
     if (procInfo.hJob) {
         CloseHandle(procInfo.hJob);
         procInfo.hJob = NULL;
+    }
+    if (procInfo.hStdOutRead) {
+        CloseHandle(procInfo.hStdOutRead);
+        procInfo.hStdOutRead = NULL;
+    }
+    if (procInfo.hStdErrRead) {
+        CloseHandle(procInfo.hStdErrRead);
+        procInfo.hStdErrRead = NULL;
     }
     procInfo.processId = 0;
     procInfo.threadId = 0;

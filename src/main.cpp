@@ -838,6 +838,39 @@ int main(int argc, char* argv[]) {
             view.PrintStatus("Job Object Limit: ActiveProcessLimit = 1 (Breakout blocked)");
         }
 
+        // Forward child process stdout and stderr back to the caller (e.g. HMCL / terminal)
+        // so that launcher progress monitors and log windows receive real-time game logs.
+        std::thread stdoutForwarder;
+        std::thread stderrForwarder;
+
+        if (procInfo.hStdOutRead) {
+            HANDLE hRead = procInfo.hStdOutRead;
+            stdoutForwarder = std::thread([hRead]() {
+                HANDLE hCallerOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                if (!hCallerOut || hCallerOut == INVALID_HANDLE_VALUE) return;
+                char buf[4096];
+                DWORD bytesRead = 0;
+                DWORD bytesWritten = 0;
+                while (ReadFile(hRead, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0) {
+                    WriteFile(hCallerOut, buf, bytesRead, &bytesWritten, NULL);
+                }
+            });
+        }
+
+        if (procInfo.hStdErrRead) {
+            HANDLE hRead = procInfo.hStdErrRead;
+            stderrForwarder = std::thread([hRead]() {
+                HANDLE hCallerErr = GetStdHandle(STD_ERROR_HANDLE);
+                if (!hCallerErr || hCallerErr == INVALID_HANDLE_VALUE) return;
+                char buf[4096];
+                DWORD bytesRead = 0;
+                DWORD bytesWritten = 0;
+                while (ReadFile(hRead, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0) {
+                    WriteFile(hCallerErr, buf, bytesRead, &bytesWritten, NULL);
+                }
+            });
+        }
+
         // 5. Pre-flight arm WFP firewall before any instruction executes
         if (isElevated && wfp.IsActive()) {
             if (wfp.ProtectApplication(wTargetExe, whitelist)) {
@@ -1054,18 +1087,63 @@ int main(int argc, char* argv[]) {
             correlator.OnModuleLoaded(procInfo.processId, m);
         }
 
+        // Window detection callback for HMCL readiness sync
+        struct WindowCheckData {
+            DWORD targetPid;
+            HWND foundWnd;
+        };
+        auto EnumWindowsCallback = [](HWND hWnd, LPARAM lParam) -> BOOL {
+            WindowCheckData* data = reinterpret_cast<WindowCheckData*>(lParam);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hWnd, &pid);
+            if (pid == data->targetPid && IsWindowVisible(hWnd)) {
+                RECT rc;
+                if (GetWindowRect(hWnd, &rc)) {
+                    if ((rc.right - rc.left) > 120 && (rc.bottom - rc.top) > 120) {
+                        data->foundWnd = hWnd;
+                        return FALSE; // Stop enumeration
+                    }
+                }
+            }
+            return TRUE;
+        };
+
+        bool gameWindowAcknowledged = false;
+        DWORD windowDetectCounter = 0;
+        DWORD sandboxedExitCode = 0;
+
         // Loop until process exits or user exits
         uint32_t loopCounter = 0;
         while (!g_exitRequested) {
             DWORD waitRes = WaitForSingleObject(procInfo.hProcess, 500);
             if (waitRes == WAIT_OBJECT_0) {
-                DWORD exitCode = 0;
-                GetExitCodeProcess(procInfo.hProcess, &exitCode);
-                view.PrintStatus("Sandboxed process exited with code " + std::to_string(exitCode));
+                GetExitCodeProcess(procInfo.hProcess, &sandboxedExitCode);
+                view.PrintStatus("Sandboxed process exited with code " + std::to_string(sandboxedExitCode));
                 break;
             }
 
             loopCounter++;
+
+            // Game window detection safety net:
+            // When game window is established, emit sync line to guarantee launcher dismisses progress bar
+            if (!gameWindowAcknowledged) {
+                WindowCheckData checkData = { procInfo.processId, NULL };
+                EnumWindows(EnumWindowsCallback, reinterpret_cast<LPARAM>(&checkData));
+                if (checkData.foundWnd != NULL) {
+                    windowDetectCounter++;
+                    if (windowDetectCounter >= 4) { // Window stable for 2 seconds
+                        gameWindowAcknowledged = true;
+                        LogLauncherDiag("Minecraft game window confirmed for PID " + std::to_string(procInfo.processId) + ". Emitting readiness sync.");
+                        HANDLE hCallerOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                        if (hCallerOut && hCallerOut != INVALID_HANDLE_VALUE) {
+                            std::string syncMsg = "[MCGuard] Sandboxed Minecraft window ready (LWJGL version synchronized)\r\n";
+                            DWORD written = 0;
+                            WriteFile(hCallerOut, syncMsg.c_str(), (DWORD)syncMsg.size(), &written, NULL);
+                        }
+                    }
+                }
+            }
+
             // Every 3 seconds, check for newly loaded native DLLs
             if (loopCounter % 6 == 0) {
                 modTracker.CheckForNewModules(procInfo.processId, [&correlator](DWORD pid, const core::LoadedModuleInfo& mod) {
@@ -1087,9 +1165,14 @@ int main(int argc, char* argv[]) {
         }
         wfp.Detach();
         wfp.Shutdown();
+
+        // Wait for stdout and stderr forwarders to flush remaining buffers
+        if (stdoutForwarder.joinable()) stdoutForwarder.join();
+        if (stderrForwarder.joinable()) stderrForwarder.join();
+
         core::SandboxLauncher::CleanupProcessInfo(procInfo);
         view.PrintSuccess("MCGuard Sandbox session ended cleanly.");
-        return 0;
+        return (int)sandboxedExitCode;
     }
 
     // Command: watch (Default)
