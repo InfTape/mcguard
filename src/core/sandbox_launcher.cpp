@@ -132,6 +132,22 @@ bool SandboxLauncher::GrantFullAccessToFolder(const std::wstring& folderPath) {
 bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPath) {
     if (folderPath.empty() || folderPath.length() <= 3) return true;
 
+    // Boundary check: never modify User Profile root or system folders
+    wchar_t userProfileBuf[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableW(L"USERPROFILE", userProfileBuf, MAX_PATH) > 0) {
+        std::wstring wProfile(userProfileBuf);
+        for (auto& ch : wProfile) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+        while (!wProfile.empty() && wProfile.back() == L'\\') wProfile.pop_back();
+
+        std::wstring norm(folderPath);
+        for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+        while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
+
+        if (norm == wProfile || wProfile.rfind(norm + L"\\", 0) == 0) {
+            return true;
+        }
+    }
+
     PACL pOldDacl = NULL;
     PSECURITY_DESCRIPTOR pSD = NULL;
     DWORD res = GetNamedSecurityInfoW(
@@ -180,11 +196,38 @@ bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPa
 }
 
 void SandboxLauncher::GrantAncestorsTraverseAccess(const std::wstring& targetPath) {
+    wchar_t userProfileBuf[MAX_PATH] = { 0 };
+    std::wstring wProfile;
+    if (GetEnvironmentVariableW(L"USERPROFILE", userProfileBuf, MAX_PATH) > 0) {
+        wProfile = userProfileBuf;
+        for (auto& ch : wProfile) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+        while (!wProfile.empty() && wProfile.back() == L'\\') wProfile.pop_back();
+    }
+
     std::wstring path = targetPath;
     while (!path.empty() && path.length() > 3) {
         size_t lastSlash = path.find_last_of(L"\\/");
         if (lastSlash == std::wstring::npos || lastSlash <= 2) break;
         path = path.substr(0, lastSlash);
+
+        // Normalize path for boundary check
+        std::wstring norm = path;
+        for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+        while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
+
+        // Do not touch User Profile root (e.g. C:\Users\Admin), C:\Users, or drive root!
+        // BUILTIN\Users already has traverse/read rights on system and profile roots.
+        // Touching C:\Users\<User> triggers NTFS inheritance propagation to %userprofile%\Documents,
+        // causing Windows Defender Controlled Folder Access alerts and startup lag.
+        if (!wProfile.empty()) {
+            if (norm == wProfile || wProfile.rfind(norm + L"\\", 0) == 0) {
+                break;
+            }
+        }
+        if (norm.length() <= 3 || norm.rfind(L"\\users") == norm.length() - 6) {
+            break;
+        }
+
         GrantTraverseAccessToAncestor(path);
     }
 }
