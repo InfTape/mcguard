@@ -47,6 +47,9 @@ public:
     // Grant Full Access (BUILTIN\Users) to a folder so sandboxed process has read/write rights
     static bool GrantFullAccessToFolder(const std::wstring& folderPath);
 
+    // Derive Java Home directory (parent of bin/) from Java executable path
+    static std::wstring GetJavaHomeFromPath(const std::wstring& exePath);
+
     // Grant non-inheritable read/traverse access to ancestor directories of gameDir so Java toRealPath() can resolve path
     static bool GrantTraverseAccessToAncestor(const std::wstring& folderPath);
     static void GrantAncestorsTraverseAccess(const std::wstring& targetPath);

@@ -720,8 +720,32 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        std::wstring mcRoot;
+        if (!gameDir.empty()) {
+            std::wstring lowerGame = gameDir;
+            for (auto& ch : lowerGame) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+            size_t p = lowerGame.find(L".minecraft");
+            if (p != std::wstring::npos) {
+                mcRoot = gameDir.substr(0, p + 10);
+            }
+        }
+        if (mcRoot.empty()) {
+            std::wstring lowerCmd = wCmdLine;
+            for (auto& ch : lowerCmd) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+            size_t p = lowerCmd.find(L".minecraft");
+            if (p != std::wstring::npos) {
+                size_t start = wCmdLine.rfind(L'\"', p);
+                if (start == std::wstring::npos) start = wCmdLine.rfind(L' ', p);
+                start = (start == std::wstring::npos) ? 0 : start + 1;
+                mcRoot = wCmdLine.substr(start, (p + 10) - start);
+            }
+        }
+
         if (!gameDir.empty()) {
             view.PrintStatus("Target Game Directory: " + util::WideToUtf8(gameDir));
+        }
+        if (!mcRoot.empty() && mcRoot != gameDir) {
+            view.PrintStatus("Detected .minecraft Root: " + util::WideToUtf8(mcRoot));
         }
 
         // 2. Prepare Sandbox Options
@@ -751,11 +775,12 @@ int main(int argc, char* argv[]) {
             }
         } else if (!cfg.protectedPaths.empty()) {
             // Legacy NRNW tagging mode
+            std::wstring excludeDir = !mcRoot.empty() ? mcRoot : gameDir;
             std::vector<std::wstring> appliedPaths;
-            core::SandboxLauncher::ApplyProtectedPaths(cfg.protectedPaths, appliedPaths, gameDir);
+            core::SandboxLauncher::ApplyProtectedPaths(cfg.protectedPaths, appliedPaths, excludeDir);
             sbOptions.protectedPaths = appliedPaths;
             g_appliedProtectedPaths = appliedPaths;
-            g_protectedGameDir = gameDir;
+            g_protectedGameDir = excludeDir;
             g_restoreOnExit = cfg.sandbox.restoreOnExit;
 
             for (const auto& appPath : appliedPaths) {
@@ -954,6 +979,13 @@ int main(int argc, char* argv[]) {
         correlator.SetSensitivePatterns(cfg.sensitivePatterns);
         if (!gameDir.empty()) {
             correlator.AddAllowedFolder(gameDir, "Minecraft Game Dir");
+        }
+        if (!mcRoot.empty() && mcRoot != gameDir) {
+            correlator.AddAllowedFolder(mcRoot, "Minecraft Root Dir");
+        }
+        std::wstring javaHome = core::SandboxLauncher::GetJavaHomeFromPath(wTargetExe);
+        if (!javaHome.empty()) {
+            correlator.AddAllowedFolder(javaHome, "Java Home Runtime");
         }
         correlator.SetAuditCallback([&view](const core::AuditRecord& rec) {
             view.DisplayRecord(rec);

@@ -101,6 +101,28 @@ bool SandboxLauncher::GrantFullAccessToFolder(const std::wstring& folderPath) {
         return false;
     }
 
+    // Fast check: if BUILTIN\Users already has FullControl with inheritance, no update needed
+    if (pOldDacl) {
+        for (WORD i = 0; i < pOldDacl->AceCount; ++i) {
+            LPVOID pAce = NULL;
+            if (GetAce(pOldDacl, i, &pAce)) {
+                PACE_HEADER pHeader = (PACE_HEADER)pAce;
+                if (pHeader->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+                    PACCESS_ALLOWED_ACE pAllowedAce = (PACCESS_ALLOWED_ACE)pAce;
+                    PSID pSid = (PSID)&pAllowedAce->SidStart;
+                    if (EqualSid(pSid, pUsersSid)) {
+                        if ((pAllowedAce->Mask & GENERIC_ALL) == GENERIC_ALL || 
+                            (pAllowedAce->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS) {
+                            LocalFree(pUsersSid);
+                            LocalFree(pSD);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     EXPLICIT_ACCESS_W ea = { 0 };
     ea.grfAccessPermissions = GENERIC_ALL;
     ea.grfAccessMode = GRANT_ACCESS;
@@ -129,21 +151,47 @@ bool SandboxLauncher::GrantFullAccessToFolder(const std::wstring& folderPath) {
     return (res == ERROR_SUCCESS);
 }
 
+std::wstring SandboxLauncher::GetJavaHomeFromPath(const std::wstring& exePath) {
+    if (exePath.empty()) return L"";
+    std::wstring path = exePath;
+    for (auto& ch : path) { if (ch == L'/') ch = L'\\'; }
+    while (!path.empty() && path.back() == L'\\') path.pop_back();
+
+    size_t lastSlash = path.find_last_of(L'\\');
+    if (lastSlash == std::wstring::npos) return L"";
+    std::wstring parent = path.substr(0, lastSlash);
+
+    size_t pSlash = parent.find_last_of(L'\\');
+    std::wstring binName = (pSlash != std::wstring::npos) ? parent.substr(pSlash + 1) : parent;
+    std::wstring binLower = binName;
+    for (auto& ch : binLower) ch = towlower(ch);
+
+    if (binLower == L"bin" && pSlash != std::wstring::npos) {
+        return parent.substr(0, pSlash);
+    }
+    return parent;
+}
+
 bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPath) {
     if (folderPath.empty() || folderPath.length() <= 3) return true;
 
-    // Boundary check: never modify User Profile root or system folders
+    std::wstring norm(folderPath);
+    for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+    while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
+
+    // Boundary check: never modify root drive or C:\Users
+    if (norm.length() <= 3 || norm.rfind(L"\\users") == norm.length() - 6) {
+        return true;
+    }
+
+    // Never modify ancestors strictly above User Profile root (e.g. C:\Users, C:\)
     wchar_t userProfileBuf[MAX_PATH] = { 0 };
     if (GetEnvironmentVariableW(L"USERPROFILE", userProfileBuf, MAX_PATH) > 0) {
         std::wstring wProfile(userProfileBuf);
         for (auto& ch : wProfile) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
         while (!wProfile.empty() && wProfile.back() == L'\\') wProfile.pop_back();
 
-        std::wstring norm(folderPath);
-        for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
-        while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
-
-        if (norm == wProfile || wProfile.rfind(norm + L"\\", 0) == 0) {
+        if (wProfile.rfind(norm + L"\\", 0) == 0) {
             return true;
         }
     }
@@ -165,6 +213,27 @@ bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPa
     if (!ConvertStringSidToSidW(L"S-1-5-32-545", &pUsersSid)) { // BUILTIN\Users
         if (pSD) LocalFree(pSD);
         return false;
+    }
+
+    // Fast check: if BUILTIN\Users already has traverse / read permission, return immediately
+    if (pOldDacl) {
+        for (WORD i = 0; i < pOldDacl->AceCount; ++i) {
+            LPVOID pAce = NULL;
+            if (GetAce(pOldDacl, i, &pAce)) {
+                PACE_HEADER pHeader = (PACE_HEADER)pAce;
+                if (pHeader->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+                    PACCESS_ALLOWED_ACE pAllowedAce = (PACCESS_ALLOWED_ACE)pAce;
+                    PSID pSid = (PSID)&pAllowedAce->SidStart;
+                    if (EqualSid(pSid, pUsersSid)) {
+                        if ((pAllowedAce->Mask & (FILE_TRAVERSE | GENERIC_READ | GENERIC_ALL | FILE_GENERIC_READ)) != 0) {
+                            LocalFree(pUsersSid);
+                            LocalFree(pSD);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     EXPLICIT_ACCESS_W ea = { 0 };
@@ -215,12 +284,9 @@ void SandboxLauncher::GrantAncestorsTraverseAccess(const std::wstring& targetPat
         for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
         while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
 
-        // Do not touch User Profile root (e.g. C:\Users\Admin), C:\Users, or drive root!
-        // BUILTIN\Users already has traverse/read rights on system and profile roots.
-        // Touching C:\Users\<User> triggers NTFS inheritance propagation to %userprofile%\Documents,
-        // causing Windows Defender Controlled Folder Access alerts and startup lag.
+        // Boundary: strictly above user profile root (e.g. C:\Users or C:\) or root path
         if (!wProfile.empty()) {
-            if (norm == wProfile || wProfile.rfind(norm + L"\\", 0) == 0) {
+            if (wProfile.rfind(norm + L"\\", 0) == 0) {
                 break;
             }
         }
@@ -229,6 +295,12 @@ void SandboxLauncher::GrantAncestorsTraverseAccess(const std::wstring& targetPat
         }
 
         GrantTraverseAccessToAncestor(path);
+
+        // Once we have granted traverse access to user profile root (norm == wProfile),
+        // we stop going further up into C:\Users or C:\ drive root.
+        if (!wProfile.empty() && norm == wProfile) {
+            break;
+        }
     }
 }
 
@@ -505,33 +577,89 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     SandboxProcessInfo& outInfo,
     std::string& outError
 ) {
-    // 1. Configure Mandatory Integrity Control & DACL Access
-    if (!options.gameDir.empty()) {
+    // Helper to grant necessary directory access for sandboxed Minecraft
+    auto grantDirAccess = [&options](const std::wstring& dir) {
+        if (dir.empty()) return;
+        DWORD attr = GetFileAttributesW(dir.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return;
         if (options.denyUserSid) {
-            GrantAncestorsTraverseAccess(options.gameDir);
-            GrantFullAccessToFolder(options.gameDir);
-            GrantSubdirectoriesAccess(options.gameDir);
+            GrantAncestorsTraverseAccess(dir);
+            GrantFullAccessToFolder(dir);
+            GrantSubdirectoriesAccess(dir);
         }
         if (options.lowIntegrity) {
-            GrantLowIntegrityAccessToFolder(options.gameDir);
+            GrantLowIntegrityAccessToFolder(dir);
+        }
+    };
+
+    // 1. Configure Mandatory Integrity Control & DACL Access
+    if (!options.gameDir.empty()) {
+        grantDirAccess(options.gameDir);
+    }
+
+    // Auto-detect .minecraft root and grant access to its standard structure (libraries, assets, versions, mods, config)
+    std::wstring mcRoot;
+    if (!options.gameDir.empty()) {
+        std::wstring lowerGameDir = options.gameDir;
+        for (auto& ch : lowerGameDir) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+        size_t mcPos = lowerGameDir.find(L".minecraft");
+        if (mcPos != std::wstring::npos) {
+            mcRoot = options.gameDir.substr(0, mcPos + 10);
+        }
+    }
+    if (mcRoot.empty() && !commandLine.empty()) {
+        std::wstring lowerCmd = commandLine;
+        for (auto& ch : lowerCmd) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+        size_t cmdMcPos = lowerCmd.find(L".minecraft");
+        if (cmdMcPos != std::wstring::npos) {
+            size_t start = commandLine.rfind(L'\"', cmdMcPos);
+            if (start == std::wstring::npos) start = commandLine.rfind(L' ', cmdMcPos);
+            start = (start == std::wstring::npos) ? 0 : start + 1;
+            mcRoot = commandLine.substr(start, (cmdMcPos + 10) - start);
+        }
+    }
+
+    if (!mcRoot.empty() && mcRoot != options.gameDir) {
+        grantDirAccess(mcRoot);
+    }
+    if (!mcRoot.empty()) {
+        static const std::vector<std::wstring> s_mcSubDirs = {
+            L"libraries", L"assets", L"versions", L"mods", L"config"
+        };
+        for (const auto& sub : s_mcSubDirs) {
+            std::wstring subPath = mcRoot;
+            if (subPath.back() != L'\\') subPath += L'\\';
+            subPath += sub;
+            grantDirAccess(subPath);
+        }
+    }
+
+    // Grant access to Java executable directory and Java Home runtime
+    if (!applicationPath.empty()) {
+        if (options.denyUserSid) {
+            GrantAncestorsTraverseAccess(applicationPath);
+        }
+        std::wstring javaHome = GetJavaHomeFromPath(applicationPath);
+        if (!javaHome.empty()) {
+            grantDirAccess(javaHome);
+        }
+        size_t lastSlash = applicationPath.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) {
+            std::wstring binDir = applicationPath.substr(0, lastSlash);
+            grantDirAccess(binDir);
         }
     }
 
     wchar_t tempPath[MAX_PATH] = { 0 };
     if (GetTempPathW(MAX_PATH, tempPath)) {
-        if (options.denyUserSid) {
-            GrantAncestorsTraverseAccess(tempPath);
-            GrantFullAccessToFolder(tempPath);
-        }
-        if (options.lowIntegrity) {
-            GrantLowIntegrityAccessToFolder(tempPath);
-        }
+        grantDirAccess(tempPath);
     }
 
     // Only apply NRNW disk labels if denyUserSid is disabled (legacy fallback)
     if (options.lowIntegrity && !options.denyUserSid) {
+        std::wstring excludeDir = !mcRoot.empty() ? mcRoot : options.gameDir;
         for (const auto& p : options.protectedPaths) {
-            ProtectPathFromLowIntegrity(p, options.gameDir);
+            ProtectPathFromLowIntegrity(p, excludeDir);
         }
     }
 
