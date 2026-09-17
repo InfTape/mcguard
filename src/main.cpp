@@ -59,6 +59,42 @@ void PrintUsage() {
               << "  --help                 Show this help message\n";
 }
 
+void LogLauncherDiag(const std::string& msg) {
+    wchar_t exePath[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+        std::wstring wExe(exePath);
+        size_t lastSlash = wExe.find_last_of(L"\\/");
+        std::wstring logPath = (lastSlash != std::wstring::npos ? wExe.substr(0, lastSlash + 1) : L"") + L"mcguard_launcher_diag.log";
+        std::ofstream ofs(logPath, std::ios::app);
+        if (ofs.is_open()) {
+            ofs << "[" << util::GetCurrentTimeString() << "] " << msg << std::endl;
+        }
+    }
+}
+
+static std::wstring BuildProxyCommandLine(const std::wstring& realJava) {
+    const wchar_t* cmdLine = GetCommandLineW();
+    if (!cmdLine) return L"\"" + realJava + L"\"";
+
+    const wchar_t* p = cmdLine;
+    while (*p == L' ' || *p == L'\t') p++;
+    if (*p == L'\"') {
+        p++;
+        while (*p && *p != L'\"') p++;
+        if (*p == L'\"') p++;
+    } else {
+        while (*p && *p != L' ' && *p != L'\t') p++;
+    }
+    while (*p == L' ' || *p == L'\t') p++;
+
+    std::wstring result = L"\"" + realJava + L"\"";
+    if (*p) {
+        result += L" ";
+        result += p;
+    }
+    return result;
+}
+
 int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
@@ -116,39 +152,52 @@ int main(int argc, char* argv[]) {
 
     if (!isExplicitCommand && argc > 1) {
         // Invoked as Java proxy!
-        // 1. Check if this is a Java information / probe query (e.g. HMCL or CLI probing version/properties)
-        bool isProbe = false;
+        LogLauncherDiag("Invoked as Java proxy with " + std::to_string(argc) + " arguments.");
+
+        // 1. Check if this is a Minecraft Game Launch!
+        bool isMinecraftLaunch = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
-            if (a == "org.glavo.info.Main" ||
-                a == "-version" || a == "--version" ||
-                a == "-showversion" || a == "-fullversion" ||
-                a.rfind("-XshowSettings", 0) == 0 ||
-                a == "-help" || a == "-?") {
-                isProbe = true;
+            if (a == "--gameDir" || a == "--assetsDir" || a == "--accessToken" ||
+                a == "--username" || a == "--uuid" || a == "--versionType" ||
+                a.rfind("-Dminecraft.", 0) == 0 ||
+                a.find("net.minecraft") != std::string::npos ||
+                a.find("net.fabricmc") != std::string::npos ||
+                a.find("cpw.mods") != std::string::npos ||
+                a.find("net.neoforged") != std::string::npos) {
+                isMinecraftLaunch = true;
                 break;
             }
         }
 
+        // 2. Check if this is a Java information / probe query (e.g. HMCL or CLI probing version/properties)
+        bool isProbe = false;
+        if (!isMinecraftLaunch) {
+            for (int i = 1; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "org.glavo.info.Main" ||
+                    a == "-version" || a == "--version" ||
+                    a == "-showversion" || a == "-fullversion" ||
+                    a.rfind("-XshowSettings", 0) == 0 ||
+                    a == "-help" || a == "-?") {
+                    isProbe = true;
+                    break;
+                }
+            }
+        }
+
         if (isProbe) {
-            // Forward directly to real java.exe without any MCGuard output
+            LogLauncherDiag("Detected Java probe query. Forwarding directly to real java.exe via RunJavaProbe.");
             std::wstring realJava = core::SandboxLauncher::AutoDetectRealJava(cfg.sandbox.realJavaPath, true /* prefer console java.exe */);
             return core::SandboxLauncher::RunJavaProbe(realJava, argc, argv);
         }
 
-        // 2. Otherwise, this is a Minecraft Game Launch!
+        // 3. Otherwise, this is a Minecraft Game Launch!
+        LogLauncherDiag("Confirmed Minecraft Game Launch! Routing to sandbox supervisor.");
         command = "sandbox";
         std::wstring realJava = core::SandboxLauncher::AutoDetectRealJava(cfg.sandbox.realJavaPath, false /* prefer javaw.exe */);
         targetExe = util::WideToUtf8(realJava);
-        targetCmdLine = "\"" + targetExe + "\" ";
-        for (int k = 1; k < argc; ++k) {
-            std::string a = argv[k];
-            if (a.find(' ') != std::string::npos) {
-                targetCmdLine += "\"" + a + "\" ";
-            } else {
-                targetCmdLine += a + " ";
-            }
-        }
+        targetCmdLine = util::WideToUtf8(BuildProxyCommandLine(realJava));
     } else if (isExplicitCommand) {
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -505,15 +554,19 @@ int main(int argc, char* argv[]) {
         // 4. Launch in suspended state
         core::SandboxProcessInfo procInfo;
         std::string launchErr;
+        LogLauncherDiag("Launching Sandboxed Process: " + targetExe);
+        LogLauncherDiag("Target Command Line (truncated): " + (targetCmdLine.size() > 300 ? targetCmdLine.substr(0, 300) + "..." : targetCmdLine));
         bool launched = core::SandboxLauncher::LaunchSandboxedProcess(
             wTargetExe, wCmdLine, sbOptions, procInfo, launchErr
         );
 
         if (!launched) {
+            LogLauncherDiag("Sandbox launch FAILED: " + launchErr);
             view.PrintError("Sandbox launch failed: " + launchErr);
             return 1;
         }
 
+        LogLauncherDiag("Sandbox launch SUCCESS. Sandboxed PID=" + std::to_string(procInfo.processId));
         view.PrintSuccess("Process created inside Sandbox (PID: " + std::to_string(procInfo.processId) + ")");
         if (sbOptions.lowIntegrity) {
             view.PrintStatus("Integrity Level: LOW (S-1-16-4096) - Write access denied to system/user folders");
@@ -571,7 +624,11 @@ int main(int argc, char* argv[]) {
         // 7. If running without a visible console window (e.g. launched by HMCL / PCL with CREATE_NO_WINDOW),
         // spawn a dedicated monitor process to display an independent, authentic, interactive monitor window on the desktop!
         HWND hCurrentConsole = GetConsoleWindow();
-        if (hCurrentConsole == NULL || !IsWindowVisible(hCurrentConsole)) {
+        bool isConsoleVisible = (hCurrentConsole != NULL && IsWindowVisible(hCurrentConsole));
+        LogLauncherDiag("Console check: hCurrentConsole=" + std::to_string((uintptr_t)hCurrentConsole) +
+                        ", isVisible=" + std::to_string(isConsoleVisible));
+
+        if (!isConsoleVisible) {
             wchar_t exePath[MAX_PATH];
             GetModuleFileNameW(NULL, exePath, MAX_PATH);
 
@@ -587,7 +644,7 @@ int main(int argc, char* argv[]) {
             monSi.lpDesktop = (LPWSTR)L"WinSta0\\Default";
             PROCESS_INFORMATION monPi = { 0 };
 
-            // Primary: Direct invocation with CREATE_NEW_CONSOLE bound to interactive desktop
+            // Attempt 1: Direct invocation with CREATE_NEW_CONSOLE bound to interactive desktop
             BOOL monOk = CreateProcessW(
                 exePath,
                 monCmdBuf.data(),
@@ -597,8 +654,25 @@ int main(int argc, char* argv[]) {
                 &monSi, &monPi
             );
 
+            // Attempt 2: Direct invocation without explicit lpDesktop
             if (!monOk) {
-                // Fallback: via conhost.exe
+                DWORD err1 = GetLastError();
+                LogLauncherDiag("Monitor spawn attempt 1 (direct WinSta0\\Default) failed: code " + std::to_string(err1));
+                monSi.lpDesktop = NULL;
+                monOk = CreateProcessW(
+                    exePath,
+                    monCmdBuf.data(),
+                    NULL, NULL, FALSE,
+                    CREATE_NEW_CONSOLE,
+                    NULL, NULL,
+                    &monSi, &monPi
+                );
+            }
+
+            // Attempt 3: Fallback via conhost.exe with WinSta0\Default
+            if (!monOk) {
+                DWORD err2 = GetLastError();
+                LogLauncherDiag("Monitor spawn attempt 2 (direct default desktop) failed: code " + std::to_string(err2));
                 wchar_t sysDir[MAX_PATH];
                 GetSystemDirectoryW(sysDir, MAX_PATH);
                 std::wstring conhostPath = std::wstring(sysDir) + L"\\conhost.exe";
@@ -609,6 +683,7 @@ int main(int argc, char* argv[]) {
                 std::vector<wchar_t> conhostBuf(conhostCmd.begin(), conhostCmd.end());
                 conhostBuf.push_back(L'\0');
 
+                monSi.lpDesktop = (LPWSTR)L"WinSta0\\Default";
                 monOk = CreateProcessW(
                     conhostPath.c_str(),
                     conhostBuf.data(),
@@ -617,14 +692,32 @@ int main(int argc, char* argv[]) {
                     NULL, NULL,
                     &monSi, &monPi
                 );
+
+                // Attempt 4: Fallback via conhost.exe without explicit lpDesktop
+                if (!monOk) {
+                    DWORD err3 = GetLastError();
+                    LogLauncherDiag("Monitor spawn attempt 3 (conhost WinSta0\\Default) failed: code " + std::to_string(err3));
+                    monSi.lpDesktop = NULL;
+                    monOk = CreateProcessW(
+                        conhostPath.c_str(),
+                        conhostBuf.data(),
+                        NULL, NULL, FALSE,
+                        CREATE_NEW_CONSOLE,
+                        NULL, NULL,
+                        &monSi, &monPi
+                    );
+                }
             }
 
             if (monOk) {
+                LogLauncherDiag("Dedicated Security Monitor console launched successfully. Monitor PID=" + std::to_string(monPi.dwProcessId));
                 CloseHandle(monPi.hProcess);
                 CloseHandle(monPi.hThread);
                 view.PrintSuccess("Dedicated Security Monitor console window launched.");
             } else {
-                view.PrintError("Failed to launch monitor console: error " + std::to_string(GetLastError()));
+                DWORD errFinal = GetLastError();
+                LogLauncherDiag("Failed to launch monitor console after all attempts: code " + std::to_string(errFinal));
+                view.PrintError("Failed to launch monitor console: error " + std::to_string(errFinal));
             }
         }
 
