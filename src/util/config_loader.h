@@ -21,6 +21,7 @@ struct ConfigData {
     std::vector<std::string> sensitivePatterns;
     std::vector<std::string> allowedDomainSuffixes;
     std::vector<std::string> allowedFolders;
+    std::vector<std::string> protectedPaths;
     bool allowLocalhost = true;
     bool allowLan = true;
     bool allowDns = true;

@@ -15,6 +15,7 @@ struct SandboxOptions {
     bool useJobObject = true;         // ActiveProcessLimit = 1
     bool startSuspended = true;       // Launch in suspended state to allow pre-flight WFP binding
     std::wstring gameDir;             // Minecraft game directory to grant Low Integrity write access to
+    std::vector<std::wstring> protectedPaths; // Paths protected with No-Read-Up & No-Write-Up
 };
 
 struct SandboxProcessInfo {
@@ -38,6 +39,13 @@ public:
 
     // Grant Low-Integrity write/modify access to a directory (e.g. .minecraft or temp)
     static bool GrantLowIntegrityAccessToFolder(const std::wstring& folderPath);
+
+    // Apply Windows Mandatory Integrity Control (MIC) No-Read-Up & No-Write-Up (NRNW) label
+    // to prevent Low-Integrity processes from reading and writing to this path.
+    static bool ProtectPathFromLowIntegrity(const std::wstring& targetPath);
+
+    // Apply NRNW protection to a list of paths (supports environment variables e.g. %APPDATA%)
+    static void ApplyProtectedPaths(const std::vector<std::string>& paths, std::vector<std::wstring>& outApplied);
 
     // Resume a suspended sandboxed process thread after WFP/ETW attachment
     static bool ResumeSandboxedProcess(SandboxProcessInfo& procInfo);

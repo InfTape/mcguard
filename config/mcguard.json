@@ -60,7 +60,8 @@
       "Cookies",
       "Login Data",
       "Local State",
-      "tokens.json"
+      "tokens.json",
+      "user-account-private-data.json"
     ]
   },
   "logging": {
@@ -74,6 +75,10 @@
     "low_integrity": true,
     "strip_privileges": true,
     "use_job_object": true,
-    "real_java_path": ""
+    "real_java_path": "",
+    "protected_paths": [
+      "%APPDATA%\\.hmcl\\private\\user-account-private-data.json",
+      "%USERPROFILE%\\.ssh"
+    ]
   }
 }

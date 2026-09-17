@@ -683,6 +683,26 @@ int main(int argc, char* argv[]) {
         sbOptions.startSuspended = true;
         sbOptions.gameDir = gameDir;
 
+        // Apply kernel-level No-Read-Up & No-Write-Up (NRNW) Mandatory Label protection
+        if (!cfg.protectedPaths.empty()) {
+            std::vector<std::wstring> appliedPaths;
+            core::SandboxLauncher::ApplyProtectedPaths(cfg.protectedPaths, appliedPaths);
+            sbOptions.protectedPaths = appliedPaths;
+
+            for (const auto& appPath : appliedPaths) {
+                std::string u8Path = util::WideToUtf8(appPath);
+                LogLauncherDiag("Kernel NRNW Protection applied: " + u8Path);
+                view.PrintSuccess("Protected Path [NRNW Active]: " + u8Path);
+
+                // Add to sensitivePatterns for ETW detection and alerting
+                cfg.sensitivePatterns.push_back(u8Path);
+                size_t lastSlash = u8Path.find_last_of("\\/");
+                if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
+                    cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
+                }
+            }
+        }
+
         // 3. Initialize WFP ALE engine
         core::WfpGuard wfp;
         g_pWfp = &wfp;

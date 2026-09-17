@@ -111,7 +111,12 @@
         "low_integrity": { "type": "boolean" },
         "strip_privileges": { "type": "boolean" },
         "use_job_object": { "type": "boolean" },
-        "real_java_path": { "type": "string" }
+        "real_java_path": { "type": "string" },
+        "protected_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of private files or directories to protect with Windows Mandatory Integrity Control (MIC) No-Read-Up & No-Write-Up (NRNW). Low-Integrity sandboxed Minecraft/Mods are strictly denied read and write access."
+        }
       }
     }
   },

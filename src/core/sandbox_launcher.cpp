@@ -90,6 +90,64 @@ bool SandboxLauncher::GrantLowIntegrityAccessToFolder(const std::wstring& folder
     return (res == ERROR_SUCCESS);
 }
 
+static std::wstring ExpandEnvironmentPath(const std::wstring& inPath) {
+    wchar_t buf[MAX_PATH * 4] = { 0 };
+    DWORD len = ExpandEnvironmentStringsW(inPath.c_str(), buf, sizeof(buf) / sizeof(buf[0]));
+    std::wstring result = (len > 0 && len < sizeof(buf) / sizeof(buf[0])) ? std::wstring(buf) : inPath;
+    for (auto& ch : result) {
+        if (ch == L'/') ch = L'\\';
+    }
+    return result;
+}
+
+bool SandboxLauncher::ProtectPathFromLowIntegrity(const std::wstring& targetPath) {
+    if (targetPath.empty()) return false;
+
+    std::wstring expanded = ExpandEnvironmentPath(targetPath);
+    DWORD attr = GetFileAttributesW(expanded.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+
+    bool isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    // For directories: inherit to child files and containers (OICI)
+    // For files: no inheritance needed
+    const wchar_t* sddl = isDir ? L"S:(ML;OICI;NRNW;;;ME)" : L"S:(ML;;NRNW;;;ME)";
+
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &pSD, NULL)) {
+        return false;
+    }
+
+    PACL pSacl = NULL;
+    BOOL saclPresent = FALSE, saclDefaulted = FALSE;
+    GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
+
+    DWORD res = SetNamedSecurityInfoW(
+        (LPWSTR)expanded.c_str(),
+        SE_FILE_OBJECT,
+        LABEL_SECURITY_INFORMATION,
+        NULL,
+        NULL,
+        NULL,
+        pSacl
+    );
+
+    LocalFree(pSD);
+    return (res == ERROR_SUCCESS);
+}
+
+void SandboxLauncher::ApplyProtectedPaths(const std::vector<std::string>& paths, std::vector<std::wstring>& outApplied) {
+    for (const auto& p : paths) {
+        if (p.empty()) continue;
+        std::wstring wPath = util::Utf8ToWide(p);
+        std::wstring expanded = ExpandEnvironmentPath(wPath);
+        if (ProtectPathFromLowIntegrity(expanded)) {
+            outApplied.push_back(expanded);
+        }
+    }
+}
+
 bool SandboxLauncher::LaunchSandboxedProcess(
     const std::wstring& applicationPath,
     const std::wstring& commandLine,
@@ -105,6 +163,11 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         wchar_t tempPath[MAX_PATH] = { 0 };
         if (GetTempPathW(MAX_PATH, tempPath)) {
             GrantLowIntegrityAccessToFolder(tempPath);
+        }
+
+        // Apply No-Read-Up & No-Write-Up protection to protected paths
+        for (const auto& p : options.protectedPaths) {
+            ProtectPathFromLowIntegrity(p);
         }
     }
 
