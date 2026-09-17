@@ -622,7 +622,7 @@ int main(int argc, char* argv[]) {
         dnsTracker.PreResolveCommonEndpoints();
 
         // 7. If running without a visible console window (e.g. launched by HMCL / PCL with CREATE_NO_WINDOW),
-        // spawn a dedicated monitor process to display an independent, authentic, interactive monitor window on the desktop!
+        // spawn a dedicated monitor process with CREATE_NEW_CONSOLE to display an independent, authentic monitor window on the desktop!
         HWND hCurrentConsole = GetConsoleWindow();
         bool isConsoleVisible = (hCurrentConsole != NULL && IsWindowVisible(hCurrentConsole));
         LogLauncherDiag("Console check: hCurrentConsole=" + std::to_string((uintptr_t)hCurrentConsole) +
@@ -641,10 +641,9 @@ int main(int argc, char* argv[]) {
             STARTUPINFOW monSi = { sizeof(monSi) };
             monSi.dwFlags = STARTF_USESHOWWINDOW;
             monSi.wShowWindow = SW_SHOWNORMAL;
-            monSi.lpDesktop = (LPWSTR)L"WinSta0\\Default";
             PROCESS_INFORMATION monPi = { 0 };
 
-            // Attempt 1: Direct invocation with CREATE_NEW_CONSOLE bound to interactive desktop
+            // Direct invocation with CREATE_NEW_CONSOLE to pop up an independent interactive desktop console
             BOOL monOk = CreateProcessW(
                 exePath,
                 monCmdBuf.data(),
@@ -654,70 +653,15 @@ int main(int argc, char* argv[]) {
                 &monSi, &monPi
             );
 
-            // Attempt 2: Direct invocation without explicit lpDesktop
-            if (!monOk) {
-                DWORD err1 = GetLastError();
-                LogLauncherDiag("Monitor spawn attempt 1 (direct WinSta0\\Default) failed: code " + std::to_string(err1));
-                monSi.lpDesktop = NULL;
-                monOk = CreateProcessW(
-                    exePath,
-                    monCmdBuf.data(),
-                    NULL, NULL, FALSE,
-                    CREATE_NEW_CONSOLE,
-                    NULL, NULL,
-                    &monSi, &monPi
-                );
-            }
-
-            // Attempt 3: Fallback via conhost.exe with WinSta0\Default
-            if (!monOk) {
-                DWORD err2 = GetLastError();
-                LogLauncherDiag("Monitor spawn attempt 2 (direct default desktop) failed: code " + std::to_string(err2));
-                wchar_t sysDir[MAX_PATH];
-                GetSystemDirectoryW(sysDir, MAX_PATH);
-                std::wstring conhostPath = std::wstring(sysDir) + L"\\conhost.exe";
-
-                std::wstring conhostCmd = L"\"" + conhostPath + L"\" \"" + exePath + L"\" monitor --pid " +
-                                          std::to_wstring(procInfo.processId) + L" --audit \"" +
-                                          util::Utf8ToWide(view.GetLogFilePath()) + L"\"";
-                std::vector<wchar_t> conhostBuf(conhostCmd.begin(), conhostCmd.end());
-                conhostBuf.push_back(L'\0');
-
-                monSi.lpDesktop = (LPWSTR)L"WinSta0\\Default";
-                monOk = CreateProcessW(
-                    conhostPath.c_str(),
-                    conhostBuf.data(),
-                    NULL, NULL, FALSE,
-                    CREATE_NEW_CONSOLE,
-                    NULL, NULL,
-                    &monSi, &monPi
-                );
-
-                // Attempt 4: Fallback via conhost.exe without explicit lpDesktop
-                if (!monOk) {
-                    DWORD err3 = GetLastError();
-                    LogLauncherDiag("Monitor spawn attempt 3 (conhost WinSta0\\Default) failed: code " + std::to_string(err3));
-                    monSi.lpDesktop = NULL;
-                    monOk = CreateProcessW(
-                        conhostPath.c_str(),
-                        conhostBuf.data(),
-                        NULL, NULL, FALSE,
-                        CREATE_NEW_CONSOLE,
-                        NULL, NULL,
-                        &monSi, &monPi
-                    );
-                }
-            }
-
             if (monOk) {
                 LogLauncherDiag("Dedicated Security Monitor console launched successfully. Monitor PID=" + std::to_string(monPi.dwProcessId));
                 CloseHandle(monPi.hProcess);
                 CloseHandle(monPi.hThread);
                 view.PrintSuccess("Dedicated Security Monitor console window launched.");
             } else {
-                DWORD errFinal = GetLastError();
-                LogLauncherDiag("Failed to launch monitor console after all attempts: code " + std::to_string(errFinal));
-                view.PrintError("Failed to launch monitor console: error " + std::to_string(errFinal));
+                DWORD err = GetLastError();
+                LogLauncherDiag("Failed to launch monitor console: error " + std::to_string(err));
+                view.PrintError("Failed to launch monitor console: error " + std::to_string(err));
             }
         }
 
