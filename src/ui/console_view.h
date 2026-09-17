@@ -13,7 +13,8 @@ public:
     ~ConsoleView();
 
     // Enable ANSI console colors and print header
-    void Initialize();
+    void Initialize(bool wfpActive = true, const std::string& wfpDetail = "");
+    void SetWfpStatus(bool active, const std::string& detail = "") { m_wfpActive = active; m_wfpDetail = detail; }
 
     // Render a single audit record into the live console table and JSON log
     void DisplayRecord(const core::AuditRecord& record, bool writeToFile = true);
@@ -40,6 +41,8 @@ private:
     std::mutex m_renderMutex;
     bool m_ansiSupported = false;
     bool m_headerPrinted = false;
+    bool m_wfpActive = true;
+    std::string m_wfpDetail;
 };
 
 } // namespace ui

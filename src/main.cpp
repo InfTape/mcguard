@@ -5,6 +5,7 @@
 #include <csignal>
 #include <atomic>
 #include <conio.h>
+#include <shellapi.h>
 
 #include "util/privilege.h"
 #include "util/string_util.h"
@@ -136,6 +137,7 @@ int main(int argc, char* argv[]) {
     std::string targetCmdLine;
     DWORD targetPid = 0;
     std::string auditFilePath;
+    bool monitorWfpActive = false;
 
     // Determine whether MCGuard is being invoked with an explicit MCGuard subcommand
     // or as a Java executable proxy (by HMCL, PCL, or launcher)
@@ -145,7 +147,8 @@ int main(int argc, char* argv[]) {
         if (firstArg == "watch" || firstArg == "run" || firstArg == "sandbox" ||
             firstArg == "monitor" || firstArg == "test-wfp" || firstArg == "demo" ||
             firstArg == "--help" || firstArg == "-h" ||
-            firstArg == "--elevate" || firstArg == "--whitelist") {
+            firstArg == "--elevate" || firstArg == "--whitelist" ||
+            firstArg == "--wfp-service") {
             isExplicitCommand = true;
         }
     }
@@ -214,8 +217,13 @@ int main(int argc, char* argv[]) {
                         targetPid = (DWORD)std::stoul(argv[++m]);
                     } else if (mArg == "--audit" && m + 1 < argc) {
                         auditFilePath = argv[++m];
+                    } else if (mArg == "--wfp" && m + 1 < argc) {
+                        monitorWfpActive = (std::string(argv[++m]) == "1");
                     }
                 }
+                break;
+            } else if (arg == "--wfp-service") {
+                command = "--wfp-service";
                 break;
             } else if (arg == "run" || arg == "sandbox") {
                 command = "sandbox";
@@ -289,11 +297,126 @@ int main(int argc, char* argv[]) {
 
     ui::ConsoleView view("mcguard_audit.jsonl");
 
+    // Command: --wfp-service (Elevated WFP ALE helper service)
+    if (command == "--wfp-service") {
+        if (!isElevated) {
+            return 1;
+        }
+
+        std::string appPath;
+        DWORD parentPid = 0;
+        std::string configPath;
+
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--app" && i + 1 < argc) {
+                appPath = argv[++i];
+            } else if (arg == "--parent-pid" && i + 1 < argc) {
+                parentPid = (DWORD)std::stoul(argv[++i]);
+            } else if (arg == "--config" && i + 1 < argc) {
+                configPath = argv[++i];
+            }
+        }
+
+        if (appPath.empty() || parentPid == 0) {
+            return 1;
+        }
+
+        util::ConfigData helperCfg;
+        util::ConfigLoader::LoadConfig(configPath, helperCfg);
+
+        std::vector<core::WhitelistRule> helperWhitelist = helperCfg.whitelist;
+
+        core::WfpGuard wfpService;
+        if (!wfpService.Initialize()) {
+            return 1;
+        }
+
+        std::wstring wAppPath = util::Utf8ToWide(appPath);
+        if (!wfpService.ProtectApplication(wAppPath, helperWhitelist)) {
+            wfpService.Shutdown();
+            return 1;
+        }
+
+        // Setup dynamic DNS tracking
+        auto& dnsTracker = core::DnsTracker::Instance();
+        if (!helperCfg.allowedDomainSuffixes.empty()) {
+            dnsTracker.ClearAllowedDomainSuffixes();
+            for (const auto& suffix : helperCfg.allowedDomainSuffixes) {
+                dnsTracker.AddAllowedDomainSuffix(suffix);
+            }
+        }
+        dnsTracker.SetWhitelistIpCallback([&wfpService](const std::string& domain, const std::string& ip) {
+            core::WhitelistRule rule;
+            rule.description = "Allowed Domain (" + domain + ")";
+            rule.ip = ip;
+            rule.port = 0;
+            rule.protocol = "TCP";
+            wfpService.AddWhitelistRule(rule);
+        });
+        dnsTracker.PreResolveCommonEndpoints();
+
+        // Signal ready event to parent
+        std::wstring eventName = L"Local\\MCGuard_WFP_Ready_" + std::to_wstring(parentPid);
+        HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
+        if (hEvent) {
+            SetEvent(hEvent);
+            CloseHandle(hEvent);
+        }
+
+        // Connect to named pipe for dynamic updates
+        std::wstring pipeName = L"\\\\.\\pipe\\MCGuard_WFP_" + std::to_wstring(parentPid);
+        HANDLE hPipe = CreateFileW(pipeName.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (hPipe != INVALID_HANDLE_VALUE) {
+            std::thread pipeThread([hPipe, &wfpService]() {
+                char buf[512];
+                DWORD bytesRead = 0;
+                std::string pending;
+                while (ReadFile(hPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                    buf[bytesRead] = '\0';
+                    pending += buf;
+                    size_t nl;
+                    while ((nl = pending.find('\n')) != std::string::npos) {
+                        std::string line = pending.substr(0, nl);
+                        pending.erase(0, nl + 1);
+                        if (line.rfind("ADD ", 0) == 0) {
+                            std::string ip = line.substr(4);
+                            while (!ip.empty() && (ip.back() == '\r' || ip.back() == ' ')) ip.pop_back();
+                            core::WhitelistRule r;
+                            r.ip = ip;
+                            r.port = 0;
+                            r.protocol = "TCP";
+                            r.description = "Dynamic Parent Rule";
+                            wfpService.AddWhitelistRule(r);
+                        }
+                    }
+                }
+                CloseHandle(hPipe);
+            });
+            pipeThread.detach();
+        }
+
+        // Wait for parent process to exit
+        HANDLE hParent = OpenProcess(SYNCHRONIZE, FALSE, parentPid);
+        if (hParent) {
+            WaitForSingleObject(hParent, INFINITE);
+            CloseHandle(hParent);
+        }
+
+        wfpService.Shutdown();
+        return 0;
+    }
+
     // Command: monitor (Dedicated real-time GUI / interactive console monitor)
     if (command == "monitor") {
         std::string logPath = auditFilePath.empty() ? "mcguard_audit.jsonl" : auditFilePath;
         ui::ConsoleView monView(logPath);
-        monView.Initialize();
+        monView.Initialize(monitorWfpActive);
+        if (monitorWfpActive) {
+            monView.PrintSuccess("WFP Kernel Firewall: ACTIVE (Unauthorized connections dropped at packet level)");
+        } else {
+            monView.PrintWarning("WFP Kernel Firewall: INACTIVE (Admin declined / Pure audit mode)");
+        }
 
         if (targetPid != 0) {
             SetConsoleTitleW((L"MCGuard v1.1 - Minecraft Security Monitor & Real-Time Defense [PID: " + std::to_wstring(targetPid) + L"]").c_str());
@@ -547,8 +670,75 @@ int main(int argc, char* argv[]) {
         // 3. Initialize WFP ALE engine
         core::WfpGuard wfp;
         g_pWfp = &wfp;
+        bool wfpActive = false;
+        HANDLE hWfpHelperProcess = NULL;
+        HANDLE hWfpPipe = INVALID_HANDLE_VALUE;
+
         if (isElevated) {
-            wfp.Initialize();
+            if (wfp.Initialize()) {
+                wfpActive = true;
+                LogLauncherDiag("Administrator privileges detected. WFP ALE Engine initialized directly.");
+            }
+        } else {
+            // Standard user rights: Request UAC elevation to activate WFP ALE Engine
+            LogLauncherDiag("Standard user rights detected. Requesting UAC elevation for WFP ALE Engine...");
+
+            DWORD myPid = GetCurrentProcessId();
+            std::wstring eventName = L"Local\\MCGuard_WFP_Ready_" + std::to_wstring(myPid);
+            HANDLE hReadyEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+
+            std::wstring pipeName = L"\\\\.\\pipe\\MCGuard_WFP_" + std::to_wstring(myPid);
+            HANDLE hPipeServer = CreateNamedPipeW(
+                pipeName.c_str(),
+                PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1, 4096, 4096, 0, NULL
+            );
+
+            OVERLAPPED ovPipe = { 0 };
+            ovPipe.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (hPipeServer != INVALID_HANDLE_VALUE) {
+                ConnectNamedPipe(hPipeServer, &ovPipe);
+            }
+
+            wchar_t currentExe[MAX_PATH];
+            GetModuleFileNameW(NULL, currentExe, MAX_PATH);
+
+            std::wstring wfpArgs = L"--wfp-service --app \"" + wTargetExe + L"\" --parent-pid " +
+                                   std::to_wstring(myPid);
+
+            SHELLEXECUTEINFOW sei = { sizeof(sei) };
+            sei.lpVerb = L"runas";
+            sei.lpFile = currentExe;
+            sei.lpParameters = wfpArgs.c_str();
+            sei.nShow = SW_HIDE;
+            sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+
+            if (ShellExecuteExW(&sei)) {
+                hWfpHelperProcess = sei.hProcess;
+                LogLauncherDiag("UAC prompt accepted by user. Waiting for WFP service to arm...");
+
+                if (hReadyEvent && WaitForSingleObject(hReadyEvent, 5000) == WAIT_OBJECT_0) {
+                    wfpActive = true;
+                    hWfpPipe = hPipeServer;
+                    LogLauncherDiag("Elevated WFP ALE Engine successfully activated and armed!");
+                } else {
+                    LogLauncherDiag("Elevated WFP service timed out waiting for ready signal.");
+                }
+            } else {
+                DWORD uacErr = GetLastError();
+                if (uacErr == ERROR_CANCELLED) {
+                    LogLauncherDiag("User DECLINED UAC administrator prompt. WFP ALE will be INACTIVE (Audit Only).");
+                } else {
+                    LogLauncherDiag("ShellExecuteExW failed: error " + std::to_string(uacErr));
+                }
+                if (hPipeServer != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hPipeServer);
+                }
+            }
+
+            if (ovPipe.hEvent) CloseHandle(ovPipe.hEvent);
+            if (hReadyEvent) CloseHandle(hReadyEvent);
         }
 
         // 4. Launch in suspended state
@@ -587,6 +777,7 @@ int main(int argc, char* argv[]) {
 
         // 6. Setup Correlator & Handlers
         core::Correlator correlator;
+        correlator.SetWfpActive(wfpActive);
         correlator.SetWhitelistRules(whitelist);
         correlator.SetSensitivePatterns(cfg.sensitivePatterns);
         if (!gameDir.empty()) {
@@ -604,7 +795,7 @@ int main(int argc, char* argv[]) {
                 dnsTracker.AddAllowedDomainSuffix(suffix);
             }
         }
-        dnsTracker.SetWhitelistIpCallback([&wfp, &correlator, &view, &whitelist, isElevated](const std::string& domain, const std::string& ip) {
+        dnsTracker.SetWhitelistIpCallback([&wfp, &correlator, &view, &whitelist, isElevated, wfpActive, hWfpPipe](const std::string& domain, const std::string& ip) {
             core::WhitelistRule rule;
             rule.description = "Allowed Domain (" + domain + ")";
             rule.ip = ip;
@@ -616,6 +807,10 @@ int main(int argc, char* argv[]) {
 
             if (isElevated && wfp.IsActive()) {
                 wfp.AddWhitelistRule(rule);
+            } else if (wfpActive && hWfpPipe != INVALID_HANDLE_VALUE) {
+                std::string msg = "ADD " + ip + "\n";
+                DWORD written = 0;
+                WriteFile(hWfpPipe, msg.c_str(), (DWORD)msg.size(), &written, NULL);
             }
             view.PrintSuccess("Dynamically Whitelisted Domain IP: " + ip + " (" + domain + ")");
         });
@@ -634,7 +829,8 @@ int main(int argc, char* argv[]) {
 
             std::wstring monCmd = L"\"" + std::wstring(exePath) + L"\" monitor --pid " +
                                   std::to_wstring(procInfo.processId) + L" --audit \"" +
-                                  util::Utf8ToWide(view.GetLogFilePath()) + L"\"";
+                                  util::Utf8ToWide(view.GetLogFilePath()) + L"\" --wfp " +
+                                  (wfpActive ? L"1" : L"0");
             std::vector<wchar_t> monCmdBuf(monCmd.begin(), monCmd.end());
             monCmdBuf.push_back(L'\0');
 
@@ -757,6 +953,14 @@ int main(int argc, char* argv[]) {
         folderWatcher.StopWatching();
         netTracker.StopPolling();
         if (isElevated) etw.Stop();
+        if (hWfpPipe != INVALID_HANDLE_VALUE) {
+            CloseHandle(hWfpPipe);
+            hWfpPipe = INVALID_HANDLE_VALUE;
+        }
+        if (hWfpHelperProcess != NULL) {
+            CloseHandle(hWfpHelperProcess);
+            hWfpHelperProcess = NULL;
+        }
         wfp.Detach();
         wfp.Shutdown();
         core::SandboxLauncher::CleanupProcessInfo(procInfo);

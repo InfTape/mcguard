@@ -38,6 +38,8 @@ public:
     void SetWhitelistRules(const std::vector<WhitelistRule>& whitelist);
     void AddWhitelistRule(const WhitelistRule& rule);
     void SetAuditCallback(AuditCallback cb) { m_callback = cb; }
+    void SetWfpActive(bool active) { m_wfpActive = active; }
+    bool IsWfpActive() const { return m_wfpActive; }
 
     // Feed events from ETW
     void OnEtwEvent(const EtwEvent& ev);
@@ -77,6 +79,7 @@ private:
     std::mutex m_rulesMutex;
     std::mutex m_folderMutex;
     bool m_enforceFolderWhitelist = true;
+    bool m_wfpActive = false;
     AuditCallback m_callback;
 };
 

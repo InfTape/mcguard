@@ -29,7 +29,9 @@ ConsoleView::~ConsoleView() {
     }
 }
 
-void ConsoleView::Initialize() {
+void ConsoleView::Initialize(bool wfpActive, const std::string& wfpDetail) {
+    m_wfpActive = wfpActive;
+    m_wfpDetail = wfpDetail;
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut != INVALID_HANDLE_VALUE) {
         DWORD dwMode = 0;
@@ -72,11 +74,18 @@ void ConsoleView::Initialize() {
         m_fullLogPath = m_logFilePath;
     }
 
+    std::string wfpBadge;
+    if (m_wfpActive) {
+        wfpBadge = (m_ansiSupported ? ANSI_GREEN ANSI_BOLD : "") + std::string("[WFP ALE Engine: ACTIVE]") + (m_ansiSupported ? ANSI_CYAN ANSI_BOLD : "");
+    } else {
+        wfpBadge = (m_ansiSupported ? ANSI_YELLOW ANSI_BOLD : "") + std::string("[WFP ALE Engine: INACTIVE]") + (m_ansiSupported ? ANSI_CYAN ANSI_BOLD : "");
+    }
+
     std::cout << "\n";
     std::cout << (m_ansiSupported ? ANSI_CYAN ANSI_BOLD : "")
               << "========================================================================================\n"
               << "             MCGuard - Standalone Pure User-Mode Minecraft Sandbox Auditor              \n"
-              << "     [WFP ALE Engine: Active] [ETW Kernel I/O: Active] [Native Module Audit: Active]    \n"
+              << "     " << wfpBadge << " [Process Integrity: LOW] [Native Audit: Active]    \n"
               << "========================================================================================\n"
               << (m_ansiSupported ? ANSI_RESET : "");
 

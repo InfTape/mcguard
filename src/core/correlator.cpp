@@ -327,8 +327,13 @@ void Correlator::OnNetworkConnection(DWORD pid, const std::string& remoteIp, uin
         record.action = AuditAction::ALLOW;
         record.source = "Minecraft (Allowed)";
     } else {
-        record.action = AuditAction::BLOCK;
-        record.source = "Unauthorized (Blocked)";
+        if (m_wfpActive) {
+            record.action = AuditAction::BLOCK;
+            record.source = "Unauthorized (Blocked by WFP)";
+        } else {
+            record.action = AuditAction::ALERT;
+            record.source = "Unauthorized (WFP Inactive)";
+        }
     }
 
     if (m_callback) {
