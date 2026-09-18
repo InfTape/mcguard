@@ -35,9 +35,10 @@ cl.exe /std:c++17 /EHsc /O2 /W3 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 ^
     "%~dp0src\core\module_tracker.cpp" ^
     "%~dp0src\core\correlator.cpp" ^
     "%~dp0src\core\dns_tracker.cpp" ^
+    "%~dp0src\core\ipc_broker.cpp" ^
     "%~dp0src\ui\console_view.cpp" ^
     /link /MANIFEST:EMBED /MANIFESTUAC:"level='asInvoker' uiAccess='false'" ^
-    Fwpuclnt.lib Advapi32.lib tdh.lib Ws2_32.lib Iphlpapi.lib Shell32.lib Ole32.lib User32.lib ^
+    Fwpuclnt.lib Advapi32.lib tdh.lib Ws2_32.lib Iphlpapi.lib Shell32.lib Ole32.lib User32.lib Userenv.lib ^
     /out:"%~dp0MCGuard.exe"
 
 if %errorlevel% neq 0 (

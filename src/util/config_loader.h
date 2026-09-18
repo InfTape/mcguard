@@ -18,6 +18,14 @@ struct SandboxConfig {
     std::string realJavaPath;
 };
 
+struct AppContainerConfig {
+    bool enabled = true;
+    std::string profileName = "MCGuard.Sandbox";
+    std::vector<std::string> allowedHkcuKeys = { "Software\\JavaSoft" };
+    bool enableBroker = true;
+    std::vector<std::string> brokerAllowedKeys = { "Software\\JavaSoft", "Environment" };
+};
+
 struct ConfigData {
     std::vector<core::WhitelistRule> whitelist;
     std::vector<std::string> sensitivePatterns;
@@ -35,6 +43,7 @@ struct ConfigData {
     bool autoCloseOnExit = false;
     int autoCloseDelaySeconds = 5;
     SandboxConfig sandbox;
+    AppContainerConfig appContainer;
 };
 
 class ConfigLoader {

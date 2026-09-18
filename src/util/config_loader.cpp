@@ -353,6 +353,65 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         }
     }
 
+    // Parse appcontainer settings
+    size_t acPos = configContent.find("\"appcontainer\"");
+    if (acPos == std::string::npos) {
+        acPos = configContent.find("\"app_container\"");
+    }
+    if (acPos != std::string::npos) {
+        size_t objStart = configContent.find('{', acPos);
+        size_t objEnd = configContent.find('}', objStart);
+        if (objStart != std::string::npos && objEnd != std::string::npos) {
+            std::string acStr = configContent.substr(objStart, objEnd - objStart + 1);
+            std::string en = FindJsonFieldValue(acStr, "enabled");
+            if (!en.empty()) outConfig.appContainer.enabled = (en == "true");
+
+            std::string pn = FindJsonFieldValue(acStr, "profile_name");
+            if (!pn.empty()) outConfig.appContainer.profileName = pn;
+
+            std::string eb = FindJsonFieldValue(acStr, "enable_broker");
+            if (!eb.empty()) outConfig.appContainer.enableBroker = (eb == "true");
+
+            // Parse allowed_hkcu_keys
+            size_t hkPos = acStr.find("\"allowed_hkcu_keys\"");
+            if (hkPos != std::string::npos) {
+                size_t arrStart = acStr.find('[', hkPos);
+                size_t arrEnd = acStr.find(']', arrStart);
+                if (arrStart != std::string::npos && arrEnd != std::string::npos) {
+                    outConfig.appContainer.allowedHkcuKeys.clear();
+                    std::string arrStr = acStr.substr(arrStart, arrEnd - arrStart + 1);
+                    size_t strPos = 0;
+                    while ((strPos = arrStr.find('\"', strPos)) != std::string::npos) {
+                        size_t end = arrStr.find('\"', strPos + 1);
+                        if (end == std::string::npos) break;
+                        std::string k = arrStr.substr(strPos + 1, end - strPos - 1);
+                        if (!k.empty()) outConfig.appContainer.allowedHkcuKeys.push_back(k);
+                        strPos = end + 1;
+                    }
+                }
+            }
+
+            // Parse broker_allowed_keys
+            size_t bakPos = acStr.find("\"broker_allowed_keys\"");
+            if (bakPos != std::string::npos) {
+                size_t arrStart = acStr.find('[', bakPos);
+                size_t arrEnd = acStr.find(']', arrStart);
+                if (arrStart != std::string::npos && arrEnd != std::string::npos) {
+                    outConfig.appContainer.brokerAllowedKeys.clear();
+                    std::string arrStr = acStr.substr(arrStart, arrEnd - arrStart + 1);
+                    size_t strPos = 0;
+                    while ((strPos = arrStr.find('\"', strPos)) != std::string::npos) {
+                        size_t end = arrStr.find('\"', strPos + 1);
+                        if (end == std::string::npos) break;
+                        std::string k = arrStr.substr(strPos + 1, end - strPos - 1);
+                        if (!k.empty()) outConfig.appContainer.brokerAllowedKeys.push_back(k);
+                        strPos = end + 1;
+                    }
+                }
+            }
+        }
+    }
+
     // Parse auto_close settings
     std::string autoCloseStr = FindJsonFieldValue(configContent, "auto_close_on_exit");
     if (autoCloseStr.empty()) {

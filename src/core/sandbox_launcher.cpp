@@ -6,166 +6,16 @@
 #include "../util/string_util.h"
 #include <iostream>
 #include <vector>
+#include <map>
+#include <userenv.h>
+#include <combaseapi.h>
 
+#pragma comment(lib, "Userenv.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Ole32.lib")
 
 namespace mcguard {
 namespace core {
-
-HANDLE SandboxLauncher::CreateLowIntegrityRestrictedToken(bool stripPrivileges, bool lowIntegrity, bool denyUserSid, std::string& outError) {
-    HANDLE hCurrentToken = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, &hCurrentToken)) {
-        outError = "Failed to open current process token: " + std::to_string(GetLastError());
-        return NULL;
-    }
-
-    DWORD flags = stripPrivileges ? DISABLE_MAX_PRIVILEGE : 0;
-    std::vector<SID_AND_ATTRIBUTES> sidsToDisable;
-
-    if (denyUserSid) {
-        DWORD len = 0;
-        GetTokenInformation(hCurrentToken, TokenUser, NULL, 0, &len);
-        if (len > 0) {
-            std::vector<BYTE> userBuf(len);
-            PTOKEN_USER pUser = (PTOKEN_USER)userBuf.data();
-            if (GetTokenInformation(hCurrentToken, TokenUser, pUser, len, &len)) {
-                SID_AND_ATTRIBUTES sa = { 0 };
-                sa.Sid = pUser->User.Sid;
-                sa.Attributes = 0; // SE_GROUP_USE_FOR_DENY_ONLY
-                sidsToDisable.push_back(sa);
-            }
-        }
-    }
-
-    HANDLE hTargetToken = NULL;
-    // Always call CreateRestrictedToken so the resulting token is marked as a restricted token
-    // of the caller, exempting standard non-administrator users from SeAssignPrimaryTokenPrivilege.
-    if (!CreateRestrictedToken(
-            hCurrentToken,
-            flags,
-            (DWORD)sidsToDisable.size(),
-            sidsToDisable.empty() ? NULL : sidsToDisable.data(),
-            0, NULL,
-            0, NULL,
-            &hTargetToken)) {
-        outError = "CreateRestrictedToken failed: " + std::to_string(GetLastError());
-        CloseHandle(hCurrentToken);
-        return NULL;
-    }
-    CloseHandle(hCurrentToken);
-
-    if (lowIntegrity) {
-        // Demote to Low Integrity Level (S-1-16-4096)
-        PSID pLowSid = NULL;
-        if (ConvertStringSidToSidW(L"S-1-16-4096", &pLowSid)) {
-            TOKEN_MANDATORY_LABEL tml = { 0 };
-            tml.Label.Attributes = SE_GROUP_INTEGRITY;
-            tml.Label.Sid = pLowSid;
-
-            if (!SetTokenInformation(hTargetToken, TokenIntegrityLevel, &tml, sizeof(tml) + GetLengthSid(pLowSid))) {
-                outError = "SetTokenInformation(TokenIntegrityLevel) failed: " + std::to_string(GetLastError());
-                LocalFree(pLowSid);
-                CloseHandle(hTargetToken);
-                return NULL;
-            }
-            LocalFree(pLowSid);
-        } else {
-            outError = "ConvertStringSidToSidW failed: " + std::to_string(GetLastError());
-            CloseHandle(hTargetToken);
-            return NULL;
-        }
-    }
-
-    return hTargetToken;
-}
-
-bool SandboxLauncher::GrantFullAccessToFolder(const std::wstring& folderPath) {
-    if (folderPath.empty()) return false;
-
-    PACL pOldDacl = NULL;
-    PSECURITY_DESCRIPTOR pSD = NULL;
-    DWORD res = GetNamedSecurityInfoW(
-        (LPWSTR)folderPath.c_str(),
-        SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        NULL, NULL,
-        &pOldDacl,
-        NULL,
-        &pSD
-    );
-    if (res != ERROR_SUCCESS) return false;
-
-    PSID pUsersSid = NULL;
-    if (!ConvertStringSidToSidW(L"S-1-5-32-545", &pUsersSid)) { // BUILTIN\Users
-        if (pSD) LocalFree(pSD);
-        return false;
-    }
-
-    // Fast check: if BUILTIN\Users already has FullControl with inheritance, no update needed
-    if (pOldDacl) {
-        for (WORD i = 0; i < pOldDacl->AceCount; ++i) {
-            LPVOID pAce = NULL;
-            if (GetAce(pOldDacl, i, &pAce)) {
-                PACE_HEADER pHeader = (PACE_HEADER)pAce;
-                if (pHeader->AceType == ACCESS_ALLOWED_ACE_TYPE) {
-                    PACCESS_ALLOWED_ACE pAllowedAce = (PACCESS_ALLOWED_ACE)pAce;
-                    PSID pSid = (PSID)&pAllowedAce->SidStart;
-                    if (EqualSid(pSid, pUsersSid)) {
-                        bool hasFullControl = ((pAllowedAce->Mask & GENERIC_ALL) == GENERIC_ALL || 
-                                               (pAllowedAce->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS);
-                        bool hasInheritance = ((pHeader->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) == 
-                                               (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE));
-                        if (hasFullControl && hasInheritance) {
-                            LocalFree(pUsersSid);
-                            LocalFree(pSD);
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    EXPLICIT_ACCESS_W ea = { 0 };
-    ea.grfAccessPermissions = GENERIC_ALL;
-    ea.grfAccessMode = GRANT_ACCESS;
-    ea.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-    ea.Trustee.ptstrName = (LPWSTR)pUsersSid;
-
-    PACL pNewDacl = NULL;
-    res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
-    if (res == ERROR_SUCCESS && pNewDacl) {
-        SECURITY_DESCRIPTOR sd;
-        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
-            if (SetSecurityDescriptorDacl(&sd, TRUE, pNewDacl, FALSE)) {
-                SECURITY_DESCRIPTOR_CONTROL control = 0;
-                DWORD revision = 0;
-                if (pSD && GetSecurityDescriptorControl(pSD, &control, &revision)) {
-                    SECURITY_DESCRIPTOR_CONTROL mask = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
-                    SetSecurityDescriptorControl(&sd, mask, control & mask);
-                }
-                if (!SetFileSecurityW(folderPath.c_str(), DACL_SECURITY_INFORMATION, &sd)) {
-                    SetNamedSecurityInfoW(
-                        (LPWSTR)folderPath.c_str(),
-                        SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        NULL, NULL,
-                        pNewDacl,
-                        NULL
-                    );
-                }
-            }
-        }
-    }
-
-    if (pNewDacl) LocalFree(pNewDacl);
-    if (pUsersSid) LocalFree(pUsersSid);
-    if (pSD) LocalFree(pSD);
-
-    return (res == ERROR_SUCCESS);
-}
 
 std::wstring SandboxLauncher::GetJavaHomeFromPath(const std::wstring& exePath) {
     if (exePath.empty()) return L"";
@@ -188,34 +38,164 @@ std::wstring SandboxLauncher::GetJavaHomeFromPath(const std::wstring& exePath) {
     return parent;
 }
 
-bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPath) {
-    if (folderPath.empty() || folderPath.length() <= 3) return true;
+bool SandboxLauncher::CreateOrGetAppContainer(
+    const std::wstring& profileName,
+    const std::wstring& displayName,
+    PSID* ppSid,
+    std::wstring& outSidStr,
+    std::wstring& outFolder,
+    std::string& outError
+) {
+    if (!ppSid) return false;
+    *ppSid = NULL;
 
-    std::wstring norm(folderPath);
-    for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
-    while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
+    HRESULT hr = CreateAppContainerProfile(
+        profileName.c_str(),
+        displayName.c_str(),
+        L"MCGuard Standalone Sandbox Profile",
+        NULL, 0,
+        ppSid
+    );
 
-    // Boundary check: never modify root drive or C:\Users
-    if (norm.length() <= 3 || norm.rfind(L"\\users") == norm.length() - 6) {
-        return true;
+    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) || !SUCCEEDED(hr)) {
+        // Already exists or create returned code, derive the deterministic AppContainer SID
+        HRESULT hrDerive = DeriveAppContainerSidFromAppContainerName(profileName.c_str(), ppSid);
+        if (!SUCCEEDED(hrDerive) || !*ppSid) {
+            outError = "Failed to create or derive AppContainer SID (HRESULT: " + std::to_string(hrDerive) + ")";
+            return false;
+        }
     }
 
-    // Never modify ancestors strictly above User Profile root (e.g. C:\Users, C:\)
-    wchar_t userProfileBuf[MAX_PATH] = { 0 };
-    if (GetEnvironmentVariableW(L"USERPROFILE", userProfileBuf, MAX_PATH) > 0) {
-        std::wstring wProfile(userProfileBuf);
-        for (auto& ch : wProfile) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
-        while (!wProfile.empty() && wProfile.back() == L'\\') wProfile.pop_back();
+    LPWSTR pStrSid = NULL;
+    if (ConvertSidToStringSidW(*ppSid, &pStrSid) && pStrSid) {
+        outSidStr = pStrSid;
 
-        if (wProfile.rfind(norm + L"\\", 0) == 0) {
-            return true;
+        LPWSTR pFolder = NULL;
+        if (SUCCEEDED(GetAppContainerFolderPath(pStrSid, &pFolder)) && pFolder) {
+            outFolder = pFolder;
+            CoTaskMemFree(pFolder);
         }
+        LocalFree(pStrSid);
+    }
+
+    // Ensure AppContainer AC Temp folder exists (Tier A)
+    if (!outFolder.empty()) {
+        std::wstring tempDir = outFolder + L"\\Temp";
+        CreateDirectoryW(tempDir.c_str(), NULL);
+        std::wstring roamingDir = outFolder + L"\\Roaming";
+        CreateDirectoryW(roamingDir.c_str(), NULL);
+    }
+
+    return true;
+}
+
+bool SandboxLauncher::GrantAppContainerRegistryAccess(
+    HKEY hRoot,
+    const std::wstring& subKey,
+    PSID pSid,
+    REGSAM access
+) {
+    if (!pSid || subKey.empty()) return false;
+
+    // Safety check: Never allow granting entire HKCU or HKCU\Software root!
+    std::wstring lowerKey = subKey;
+    for (auto& ch : lowerKey) ch = towlower(ch);
+    while (!lowerKey.empty() && (lowerKey.back() == L'\\' || lowerKey.back() == L'/')) lowerKey.pop_back();
+
+    if (lowerKey.empty() || lowerKey == L"software") {
+        return false; // Strictly rejected
+    }
+
+    HKEY hKey = NULL;
+    LSTATUS status = RegOpenKeyExW(hRoot, subKey.c_str(), 0, READ_CONTROL | WRITE_DAC, &hKey);
+    if (status != ERROR_SUCCESS) {
+        // Try creating the key if it does not exist
+        DWORD disp = 0;
+        status = RegCreateKeyExW(hRoot, subKey.c_str(), 0, NULL, 0, KEY_READ | WRITE_DAC, NULL, &hKey, &disp);
+        if (status != ERROR_SUCCESS) return false;
     }
 
     PACL pOldDacl = NULL;
     PSECURITY_DESCRIPTOR pSD = NULL;
+    DWORD res = GetSecurityInfo(hKey, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, &pOldDacl, NULL, &pSD);
+    if (res != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+
+    EXPLICIT_ACCESS_W ea = { 0 };
+    ea.grfAccessPermissions = access;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    ea.Trustee.ptstrName = (LPWSTR)pSid;
+
+    PACL pNewDacl = NULL;
+    res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
+    if (res == ERROR_SUCCESS && pNewDacl) {
+        res = SetSecurityInfo(hKey, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, pNewDacl, NULL);
+        LocalFree(pNewDacl);
+    }
+
+    if (pSD) LocalFree(pSD);
+    RegCloseKey(hKey);
+
+    return (res == ERROR_SUCCESS);
+}
+
+bool SandboxLauncher::RevokeAppContainerRegistryAccess(
+    HKEY hRoot,
+    const std::wstring& subKey,
+    PSID pSid
+) {
+    if (!pSid || subKey.empty()) return false;
+
+    HKEY hKey = NULL;
+    LSTATUS status = RegOpenKeyExW(hRoot, subKey.c_str(), 0, READ_CONTROL | WRITE_DAC, &hKey);
+    if (status != ERROR_SUCCESS) return false;
+
+    PACL pOldDacl = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    DWORD res = GetSecurityInfo(hKey, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, &pOldDacl, NULL, &pSD);
+    if (res != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+
+    EXPLICIT_ACCESS_W ea = { 0 };
+    ea.grfAccessPermissions = KEY_ALL_ACCESS;
+    ea.grfAccessMode = REVOKE_ACCESS;
+    ea.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    ea.Trustee.ptstrName = (LPWSTR)pSid;
+
+    PACL pNewDacl = NULL;
+    res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
+    if (res == ERROR_SUCCESS && pNewDacl) {
+        SetSecurityInfo(hKey, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, pNewDacl, NULL);
+        LocalFree(pNewDacl);
+    }
+
+    if (pSD) LocalFree(pSD);
+    RegCloseKey(hKey);
+
+    return (res == ERROR_SUCCESS);
+}
+
+bool SandboxLauncher::GrantAppContainerFileAccess(
+    const std::wstring& targetPath,
+    PSID pSid,
+    DWORD accessMask,
+    bool inherit
+) {
+    if (targetPath.empty() || !pSid) return false;
+
+    PACL pOldDacl = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
     DWORD res = GetNamedSecurityInfoW(
-        (LPWSTR)folderPath.c_str(),
+        (LPWSTR)targetPath.c_str(),
         SE_FILE_OBJECT,
         DACL_SECURITY_INFORMATION,
         NULL, NULL,
@@ -225,75 +205,38 @@ bool SandboxLauncher::GrantTraverseAccessToAncestor(const std::wstring& folderPa
     );
     if (res != ERROR_SUCCESS) return false;
 
-    PSID pUsersSid = NULL;
-    if (!ConvertStringSidToSidW(L"S-1-5-32-545", &pUsersSid)) { // BUILTIN\Users
-        if (pSD) LocalFree(pSD);
-        return false;
-    }
-
-    // Fast check: if BUILTIN\Users already has traverse / read permission, return immediately
-    if (pOldDacl) {
-        for (WORD i = 0; i < pOldDacl->AceCount; ++i) {
-            LPVOID pAce = NULL;
-            if (GetAce(pOldDacl, i, &pAce)) {
-                PACE_HEADER pHeader = (PACE_HEADER)pAce;
-                if (pHeader->AceType == ACCESS_ALLOWED_ACE_TYPE) {
-                    PACCESS_ALLOWED_ACE pAllowedAce = (PACCESS_ALLOWED_ACE)pAce;
-                    PSID pSid = (PSID)&pAllowedAce->SidStart;
-                    if (EqualSid(pSid, pUsersSid)) {
-                        if ((pAllowedAce->Mask & (FILE_TRAVERSE | GENERIC_READ | GENERIC_ALL | FILE_GENERIC_READ)) != 0) {
-                            LocalFree(pUsersSid);
-                            LocalFree(pSD);
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     EXPLICIT_ACCESS_W ea = { 0 };
-    ea.grfAccessPermissions = FILE_GENERIC_READ | FILE_TRAVERSE;
+    ea.grfAccessPermissions = accessMask;
     ea.grfAccessMode = GRANT_ACCESS;
-    ea.grfInheritance = NO_INHERITANCE; // Crucial: NEVER inherit to children/files (so desktop files remain blocked!)
+    ea.grfInheritance = inherit ? (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) : NO_INHERITANCE;
     ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-    ea.Trustee.ptstrName = (LPWSTR)pUsersSid;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    ea.Trustee.ptstrName = (LPWSTR)pSid;
 
     PACL pNewDacl = NULL;
     res = SetEntriesInAclW(1, &ea, pOldDacl, &pNewDacl);
     if (res == ERROR_SUCCESS && pNewDacl) {
-        SECURITY_DESCRIPTOR sd;
-        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
-            if (SetSecurityDescriptorDacl(&sd, TRUE, pNewDacl, FALSE)) {
-                SECURITY_DESCRIPTOR_CONTROL control = 0;
-                DWORD revision = 0;
-                if (pSD && GetSecurityDescriptorControl(pSD, &control, &revision)) {
-                    SECURITY_DESCRIPTOR_CONTROL mask = SE_DACL_AUTO_INHERITED | SE_DACL_PROTECTED;
-                    SetSecurityDescriptorControl(&sd, mask, control & mask);
-                }
-                if (!SetFileSecurityW(folderPath.c_str(), DACL_SECURITY_INFORMATION, &sd)) {
-                    SetNamedSecurityInfoW(
-                        (LPWSTR)folderPath.c_str(),
-                        SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        NULL, NULL,
-                        pNewDacl,
-                        NULL
-                    );
-                }
-            }
-        }
+        SetNamedSecurityInfoW(
+            (LPWSTR)targetPath.c_str(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            NULL, NULL,
+            pNewDacl,
+            NULL
+        );
+        LocalFree(pNewDacl);
     }
 
-    if (pNewDacl) LocalFree(pNewDacl);
-    if (pUsersSid) LocalFree(pUsersSid);
     if (pSD) LocalFree(pSD);
-
     return (res == ERROR_SUCCESS);
 }
 
-void SandboxLauncher::GrantAncestorsTraverseAccess(const std::wstring& targetPath) {
+void SandboxLauncher::GrantAncestorsTraverseAccess(
+    const std::wstring& targetPath,
+    PSID pSid
+) {
+    if (targetPath.empty() || !pSid) return;
+
     wchar_t userProfileBuf[MAX_PATH] = { 0 };
     std::wstring wProfile;
     if (GetEnvironmentVariableW(L"USERPROFILE", userProfileBuf, MAX_PATH) > 0) {
@@ -308,309 +251,71 @@ void SandboxLauncher::GrantAncestorsTraverseAccess(const std::wstring& targetPat
         if (lastSlash == std::wstring::npos || lastSlash <= 2) break;
         path = path.substr(0, lastSlash);
 
-        // Normalize path for boundary check
         std::wstring norm = path;
         for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
         while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
 
-        // Boundary: strictly above user profile root (e.g. C:\Users or C:\) or root path
-        if (!wProfile.empty()) {
-            if (wProfile.rfind(norm + L"\\", 0) == 0) {
-                break;
-            }
-        }
+        // Boundary: Do not grant on C:\ or C:\Users
         if (norm.length() <= 3 || norm.rfind(L"\\users") == norm.length() - 6) {
             break;
         }
 
-        GrantTraverseAccessToAncestor(path);
+        // Grant traverse (non-inheritable)
+        GrantAppContainerFileAccess(path, pSid, FILE_GENERIC_READ | FILE_TRAVERSE, false);
 
-        // Once we have granted traverse access to user profile root (norm == wProfile),
-        // we stop going further up into C:\Users or C:\ drive root.
         if (!wProfile.empty() && norm == wProfile) {
             break;
         }
     }
 }
 
-bool SandboxLauncher::GrantLowIntegrityAccessToFolder(const std::wstring& folderPath) {
-    if (folderPath.empty()) return false;
+// Build environment block redirecting LOCALAPPDATA, TEMP, TMP to AppContainer storage (Tier A)
+static std::vector<wchar_t> CreateAppContainerEnvironmentBlock(const std::wstring& acFolder) {
+    std::vector<wchar_t> result;
+    if (acFolder.empty()) return result;
 
-    DWORD attr = GetFileAttributesW(folderPath.c_str());
-    bool isDir = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
-    const wchar_t* sddl = isDir ? L"S:(ML;OICI;NW;;;LW)" : L"S:(ML;;NW;;;LW)";
+    std::wstring tempDir = acFolder + L"\\Temp";
+    std::wstring roamingDir = acFolder + L"\\Roaming";
 
-    PSECURITY_DESCRIPTOR pSD = NULL;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl,
-            SDDL_REVISION_1,
-            &pSD,
-            NULL)) {
-        return false;
+    LPWCH envStrings = GetEnvironmentStringsW();
+    if (!envStrings) return result;
+
+    struct CaseInsensitiveWCompare {
+        bool operator()(const std::wstring& a, const std::wstring& b) const {
+            return _wcsicmp(a.c_str(), b.c_str()) < 0;
+        }
+    };
+
+    std::map<std::wstring, std::wstring, CaseInsensitiveWCompare> envMap;
+
+    LPWCH curr = envStrings;
+    while (*curr) {
+        std::wstring line(curr);
+        size_t eqPos = line.find(L'=');
+        if (eqPos != std::wstring::npos && eqPos > 0) {
+            std::wstring key = line.substr(0, eqPos);
+            std::wstring val = line.substr(eqPos + 1);
+            envMap[key] = val;
+        }
+        curr += line.length() + 1;
     }
+    FreeEnvironmentStringsW(envStrings);
 
-    PACL pSacl = NULL;
-    BOOL saclPresent = FALSE, saclDefaulted = FALSE;
-    GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
+    // Tier A Overrides:
+    envMap[L"LOCALAPPDATA"] = acFolder;
+    envMap[L"TEMP"] = tempDir;
+    envMap[L"TMP"] = tempDir;
+    envMap[L"APPDATA"] = roamingDir;
 
-    DWORD res = SetNamedSecurityInfoW(
-        (LPWSTR)folderPath.c_str(),
-        SE_FILE_OBJECT,
-        LABEL_SECURITY_INFORMATION,
-        NULL,
-        NULL,
-        NULL,
-        pSacl
-    );
-
-    LocalFree(pSD);
-    return (res == ERROR_SUCCESS);
-}
-
-static std::wstring ExpandEnvironmentPath(const std::wstring& inPath) {
-    wchar_t buf[MAX_PATH * 4] = { 0 };
-    DWORD len = ExpandEnvironmentStringsW(inPath.c_str(), buf, sizeof(buf) / sizeof(buf[0]));
-    std::wstring result = (len > 0 && len < sizeof(buf) / sizeof(buf[0])) ? std::wstring(buf) : inPath;
-    for (auto& ch : result) {
-        if (ch == L'/') ch = L'\\';
+    // Flatten to double-null-terminated block
+    for (const auto& kv : envMap) {
+        std::wstring entry = kv.first + L"=" + kv.second;
+        result.insert(result.end(), entry.begin(), entry.end());
+        result.push_back(L'\0');
     }
+    result.push_back(L'\0'); // Final terminator
+
     return result;
-}
-
-static bool IsPathOverlapping(const std::wstring& pathA, const std::wstring& pathB) {
-    if (pathA.empty() || pathB.empty()) return false;
-    std::wstring a = pathA;
-    std::wstring b = pathB;
-    for (auto& ch : a) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
-    for (auto& ch : b) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
-    while (!a.empty() && a.back() == L'\\') a.pop_back();
-    while (!b.empty() && b.back() == L'\\') b.pop_back();
-
-    if (a == b) return true;
-    if (a.length() > b.length() && a.rfind(b + L'\\', 0) == 0) return true;
-    if (b.length() > a.length() && b.rfind(a + L'\\', 0) == 0) return true;
-    return false;
-}
-
-bool SandboxLauncher::ProtectPathFromLowIntegrity(const std::wstring& targetPath, const std::wstring& excludeDir) {
-    if (targetPath.empty()) return false;
-
-    std::wstring expanded = ExpandEnvironmentPath(targetPath);
-    DWORD attr = GetFileAttributesW(expanded.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES) {
-        return false;
-    }
-
-    bool isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    // For directories: inherit to child files and containers (OICI)
-    // For files: no inheritance needed
-    const wchar_t* sddl = isDir ? L"S:(ML;OICI;NRNW;;;ME)" : L"S:(ML;;NRNW;;;ME)";
-
-    PSECURITY_DESCRIPTOR pSD = NULL;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &pSD, NULL)) {
-        return false;
-    }
-
-    PACL pSacl = NULL;
-    BOOL saclPresent = FALSE, saclDefaulted = FALSE;
-    GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
-
-    DWORD res = SetNamedSecurityInfoW(
-        (LPWSTR)expanded.c_str(),
-        SE_FILE_OBJECT,
-        LABEL_SECURITY_INFORMATION,
-        NULL,
-        NULL,
-        NULL,
-        pSacl
-    );
-
-    LocalFree(pSD);
-
-    // If it's a directory, also protect existing files directly under this directory
-    // because SetNamedSecurityInfo does not automatically propagate to pre-existing child files.
-    if (res == ERROR_SUCCESS && isDir) {
-        PSECURITY_DESCRIPTOR pSDFile = NULL;
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NRNW;;;ME)", SDDL_REVISION_1, &pSDFile, NULL)) {
-            PACL pFileSacl = NULL;
-            GetSecurityDescriptorSacl(pSDFile, &saclPresent, &pFileSacl, &saclDefaulted);
-
-            std::wstring searchPattern = expanded;
-            if (searchPattern.back() != L'\\') searchPattern += L'\\';
-            searchPattern += L"*";
-
-            WIN32_FIND_DATAW fd;
-            HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-
-                    std::wstring childPath = expanded;
-                    if (childPath.back() != L'\\') childPath += L'\\';
-                    childPath += fd.cFileName;
-
-                    // Skip any item that contains or is inside excludeDir (e.g. gameDir or HMCL)
-                    if (!excludeDir.empty() && IsPathOverlapping(childPath, excludeDir)) {
-                        continue;
-                    }
-
-                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                        // Apply NRNW to pre-existing file
-                        SetNamedSecurityInfoW(
-                            (LPWSTR)childPath.c_str(),
-                            SE_FILE_OBJECT,
-                            LABEL_SECURITY_INFORMATION,
-                            NULL, NULL, NULL,
-                            pFileSacl
-                        );
-                    }
-                } while (FindNextFileW(hFind, &fd));
-                FindClose(hFind);
-            }
-
-            LocalFree(pSDFile);
-        }
-    }
-
-    return (res == ERROR_SUCCESS);
-}
-
-void SandboxLauncher::ApplyProtectedPaths(
-    const std::vector<std::string>& paths,
-    std::vector<std::wstring>& outApplied,
-    const std::wstring& excludeDir
-) {
-    for (const auto& p : paths) {
-        if (p.empty()) continue;
-        std::wstring wPath = util::Utf8ToWide(p);
-        std::wstring expanded = ExpandEnvironmentPath(wPath);
-        if (ProtectPathFromLowIntegrity(expanded, excludeDir)) {
-            outApplied.push_back(expanded);
-        }
-    }
-}
-
-bool SandboxLauncher::RestorePathIntegrity(const std::wstring& targetPath, const std::wstring& excludeDir) {
-    if (targetPath.empty()) return false;
-
-    std::wstring expanded = ExpandEnvironmentPath(targetPath);
-    DWORD attr = GetFileAttributesW(expanded.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES) {
-        return false;
-    }
-
-    bool isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    // Restore to standard default: Medium Mandatory Level with No-Write-Up (NW)
-    const wchar_t* sddl = isDir ? L"S:(ML;OICI;NW;;;ME)" : L"S:(ML;;NW;;;ME)";
-
-    PSECURITY_DESCRIPTOR pSD = NULL;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &pSD, NULL)) {
-        return false;
-    }
-
-    PACL pSacl = NULL;
-    BOOL saclPresent = FALSE, saclDefaulted = FALSE;
-    GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
-
-    DWORD res = SetNamedSecurityInfoW(
-        (LPWSTR)expanded.c_str(),
-        SE_FILE_OBJECT,
-        LABEL_SECURITY_INFORMATION,
-        NULL,
-        NULL,
-        NULL,
-        pSacl
-    );
-
-    LocalFree(pSD);
-
-    if (res == ERROR_SUCCESS && isDir) {
-        // Also restore files under this directory
-        PSECURITY_DESCRIPTOR pSDFile = NULL;
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;ME)", SDDL_REVISION_1, &pSDFile, NULL)) {
-            PACL pFileSacl = NULL;
-            GetSecurityDescriptorSacl(pSDFile, &saclPresent, &pFileSacl, &saclDefaulted);
-
-            std::wstring searchPattern = expanded;
-            if (searchPattern.back() != L'\\') searchPattern += L'\\';
-            searchPattern += L"*";
-
-            WIN32_FIND_DATAW fd;
-            HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-
-                    std::wstring childPath = expanded;
-                    if (childPath.back() != L'\\') childPath += L'\\';
-                    childPath += fd.cFileName;
-
-                    if (!excludeDir.empty() && IsPathOverlapping(childPath, excludeDir)) {
-                        continue;
-                    }
-
-                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                        SetNamedSecurityInfoW(
-                            (LPWSTR)childPath.c_str(),
-                            SE_FILE_OBJECT,
-                            LABEL_SECURITY_INFORMATION,
-                            NULL, NULL, NULL,
-                            pFileSacl
-                        );
-                    }
-                } while (FindNextFileW(hFind, &fd));
-                FindClose(hFind);
-            }
-
-            LocalFree(pSDFile);
-        }
-    }
-
-    return (res == ERROR_SUCCESS);
-}
-
-void SandboxLauncher::RestoreProtectedPaths(const std::vector<std::wstring>& paths, const std::wstring& excludeDir) {
-    for (const auto& p : paths) {
-        RestorePathIntegrity(p, excludeDir);
-    }
-}
-
-static void GrantSubdirectoriesAccess(const std::wstring& rootDir, int maxDepth = 5) {
-    if (rootDir.empty() || maxDepth <= 0) return;
-    std::wstring searchPattern = rootDir;
-    if (searchPattern.back() != L'\\') searchPattern += L'\\';
-    searchPattern += L"*";
-
-    WIN32_FIND_DATAW fd;
-    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-            std::wstring itemPath = rootDir;
-            if (itemPath.back() != L'\\') itemPath += L'\\';
-            itemPath += fd.cFileName;
-
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                SandboxLauncher::GrantFullAccessToFolder(itemPath);
-                SandboxLauncher::GrantLowIntegrityAccessToFolder(itemPath);
-
-                std::wstring nameLower = fd.cFileName;
-                for (auto& ch : nameLower) ch = towlower(ch);
-                if (nameLower != L"libraries" && nameLower != L"assets") {
-                    GrantSubdirectoriesAccess(itemPath, maxDepth - 1);
-                }
-            } else {
-                std::wstring fileName = fd.cFileName;
-                if (fileName.length() >= 4 && fileName.rfind(L".tmp") == fileName.length() - 4) {
-                    SetFileAttributesW(itemPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-                    DeleteFileW(itemPath.c_str());
-                } else {
-                    SandboxLauncher::GrantLowIntegrityAccessToFolder(itemPath);
-                }
-            }
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-    }
 }
 
 bool SandboxLauncher::LaunchSandboxedProcess(
@@ -620,27 +325,46 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     SandboxProcessInfo& outInfo,
     std::string& outError
 ) {
-    // Helper to grant necessary directory access for sandboxed Minecraft
-    auto grantDirAccess = [&options](const std::wstring& dir) {
-        if (dir.empty()) return;
-        DWORD attr = GetFileAttributesW(dir.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return;
-        if (options.denyUserSid) {
-            GrantAncestorsTraverseAccess(dir);
-            GrantFullAccessToFolder(dir);
-            GrantSubdirectoriesAccess(dir);
+    std::wstring resolvedAppPath = applicationPath;
+    if (!resolvedAppPath.empty() && resolvedAppPath.find(L'\\') == std::wstring::npos && resolvedAppPath.find(L'/') == std::wstring::npos) {
+        wchar_t searchBuf[MAX_PATH] = { 0 };
+        DWORD found = SearchPathW(NULL, resolvedAppPath.c_str(), L".exe", MAX_PATH, searchBuf, NULL);
+        if (found > 0 && found < MAX_PATH) {
+            resolvedAppPath = searchBuf;
         }
-        if (options.lowIntegrity) {
-            GrantLowIntegrityAccessToFolder(dir);
-        }
-    };
-
-    // 1. Configure Mandatory Integrity Control & DACL Access
-    if (!options.gameDir.empty()) {
-        grantDirAccess(options.gameDir);
     }
 
-    // Auto-detect .minecraft root and grant access to its standard structure (libraries, assets, versions, mods, config)
+    // 1. Initialize or obtain AppContainer profile & SID
+    PSID pAppContainerSid = NULL;
+    std::wstring sidStr, acFolder;
+    if (!CreateOrGetAppContainer(
+            options.appContainerName,
+            options.appContainerDisplayName,
+            &pAppContainerSid,
+            sidStr,
+            acFolder,
+            outError)) {
+        return false;
+    }
+
+    outInfo.pAppContainerSid = pAppContainerSid;
+    outInfo.appContainerSidStr = sidStr;
+    outInfo.appContainerFolder = acFolder;
+
+    // 2. Tier B: Grant Granular Access to Specific HKCU Subkeys
+    for (const auto& subKey : options.allowedHkcuSubkeys) {
+        if (GrantAppContainerRegistryAccess(HKEY_CURRENT_USER, subKey, pAppContainerSid, KEY_READ)) {
+            outInfo.grantedRegistryKeys.push_back(subKey);
+        }
+    }
+
+    // 3. Grant File Access to Game Directory & Java Runtime for AppContainer SID
+    if (!options.gameDir.empty()) {
+        GrantAncestorsTraverseAccess(options.gameDir, pAppContainerSid);
+        GrantAppContainerFileAccess(options.gameDir, pAppContainerSid, GENERIC_ALL, true);
+    }
+
+    // Auto-detect .minecraft root and grant full access
     std::wstring mcRoot;
     if (!options.gameDir.empty()) {
         std::wstring lowerGameDir = options.gameDir;
@@ -663,105 +387,77 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     }
 
     if (!mcRoot.empty() && mcRoot != options.gameDir) {
-        grantDirAccess(mcRoot);
-    }
-    if (!mcRoot.empty()) {
-        // Pre-create .fabric directory if it does not exist so it is properly initialized
-        std::wstring fabricDir = mcRoot;
-        if (fabricDir.back() != L'\\') fabricDir += L'\\';
-        fabricDir += L".fabric";
-        CreateDirectoryW(fabricDir.c_str(), NULL);
-        grantDirAccess(fabricDir);
-
-        static const std::vector<std::wstring> s_mcSubDirs = {
-            L"libraries", L"assets", L"versions", L"mods", L"config",
-            L".fabric", L"logs", L"saves", L".mixin.out"
-        };
-        for (const auto& sub : s_mcSubDirs) {
-            std::wstring subPath = mcRoot;
-            if (subPath.back() != L'\\') subPath += L'\\';
-            subPath += sub;
-            grantDirAccess(subPath);
-        }
+        GrantAppContainerFileAccess(mcRoot, pAppContainerSid, GENERIC_ALL, true);
     }
 
-    // Grant access to Java executable directory and Java Home runtime
-    if (!applicationPath.empty()) {
-        if (options.denyUserSid) {
-            GrantAncestorsTraverseAccess(applicationPath);
-        }
-        std::wstring javaHome = GetJavaHomeFromPath(applicationPath);
+    // Grant Java runtime access
+    if (!resolvedAppPath.empty()) {
+        GrantAncestorsTraverseAccess(resolvedAppPath, pAppContainerSid);
+        std::wstring javaHome = GetJavaHomeFromPath(resolvedAppPath);
         if (!javaHome.empty()) {
-            grantDirAccess(javaHome);
+            GrantAppContainerFileAccess(javaHome, pAppContainerSid, GENERIC_READ | GENERIC_EXECUTE, true);
         }
-        size_t lastSlash = applicationPath.find_last_of(L"\\/");
+        size_t lastSlash = resolvedAppPath.find_last_of(L"\\/");
         if (lastSlash != std::wstring::npos) {
-            std::wstring binDir = applicationPath.substr(0, lastSlash);
-            grantDirAccess(binDir);
+            std::wstring binDir = resolvedAppPath.substr(0, lastSlash);
+            GrantAppContainerFileAccess(binDir, pAppContainerSid, GENERIC_READ | GENERIC_EXECUTE, true);
         }
     }
 
-    wchar_t tempPath[MAX_PATH] = { 0 };
-    if (GetTempPathW(MAX_PATH, tempPath)) {
-        if (options.denyUserSid) {
-            GrantAncestorsTraverseAccess(tempPath);
-            GrantFullAccessToFolder(tempPath);
-        }
-        if (options.lowIntegrity) {
-            GrantLowIntegrityAccessToFolder(tempPath);
-        }
+    // Additional user-configured folders
+    for (const auto& extraFolder : options.additionalAllowedFolders) {
+        GrantAncestorsTraverseAccess(extraFolder, pAppContainerSid);
+        GrantAppContainerFileAccess(extraFolder, pAppContainerSid, GENERIC_READ, true);
     }
 
-    // Only apply NRNW disk labels if denyUserSid is disabled (legacy fallback)
-    if (options.lowIntegrity && !options.denyUserSid) {
-        std::wstring excludeDir = !mcRoot.empty() ? mcRoot : options.gameDir;
-        for (const auto& p : options.protectedPaths) {
-            ProtectPathFromLowIntegrity(p, excludeDir);
-        }
+    // 4. Prepare stdout & stderr redirection pipes with AppContainer access
+    SECURITY_DESCRIPTOR pipeSd;
+    InitializeSecurityDescriptor(&pipeSd, SECURITY_DESCRIPTOR_REVISION);
+
+    EXPLICIT_ACCESS_W pipeEa[2] = { 0 };
+    pipeEa[0].grfAccessPermissions = GENERIC_ALL;
+    pipeEa[0].grfAccessMode = GRANT_ACCESS;
+    pipeEa[0].grfInheritance = NO_INHERITANCE;
+    pipeEa[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    pipeEa[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    PSID pWorldSid = NULL;
+    ConvertStringSidToSidW(L"S-1-1-0", &pWorldSid);
+    pipeEa[0].Trustee.ptstrName = (LPWSTR)pWorldSid;
+
+    pipeEa[1].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+    pipeEa[1].grfAccessMode = GRANT_ACCESS;
+    pipeEa[1].grfInheritance = NO_INHERITANCE;
+    pipeEa[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    pipeEa[1].Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    pipeEa[1].Trustee.ptstrName = (LPWSTR)pAppContainerSid;
+
+    PACL pPipeDacl = NULL;
+    SetEntriesInAclW(2, pipeEa, NULL, &pPipeDacl);
+    if (pPipeDacl) {
+        SetSecurityDescriptorDacl(&pipeSd, TRUE, pPipeDacl, FALSE);
     }
 
-    // 2. Prepare stdout & stderr redirection pipes
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    PSECURITY_DESCRIPTOR pPipeSD = NULL;
-    if (options.lowIntegrity) {
-        // Grant write permissions to World and mark with Low Mandatory Level (NW)
-        // so that a Low Integrity child process can write to stdout/stderr pipes without ERROR_ACCESS_DENIED.
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:(A;;GA;;;WD)S:(ML;;NW;;;LW)",
-                SDDL_REVISION_1,
-                &pPipeSD,
-                NULL)) {
-            sa.lpSecurityDescriptor = pPipeSD;
-        }
-    }
+    SECURITY_ATTRIBUTES saPipe = { sizeof(saPipe), &pipeSd, TRUE };
 
     HANDLE hChildStdOutRead = NULL, hChildStdOutWrite = NULL;
     HANDLE hChildStdErrRead = NULL, hChildStdErrWrite = NULL;
-
     bool pipesCreated = false;
-    if (CreatePipe(&hChildStdOutRead, &hChildStdOutWrite, &sa, 0) &&
-        CreatePipe(&hChildStdErrRead, &hChildStdErrWrite, &sa, 0)) {
+
+    if (CreatePipe(&hChildStdOutRead, &hChildStdOutWrite, &saPipe, 0) &&
+        CreatePipe(&hChildStdErrRead, &hChildStdErrWrite, &saPipe, 0)) {
         SetHandleInformation(hChildStdOutRead, HANDLE_FLAG_INHERIT, 0);
         SetHandleInformation(hChildStdErrRead, HANDLE_FLAG_INHERIT, 0);
         pipesCreated = true;
     }
-    if (pPipeSD) {
-        LocalFree(pPipeSD);
-        pPipeSD = NULL;
-    }
 
-    // Prepare ProcThreadAttributeList for Mitigation Policy and Handle Inheritance
+    if (pPipeDacl) LocalFree(pPipeDacl);
+    if (pWorldSid) LocalFree(pWorldSid);
+
+    // 5. Configure STARTUPINFOEXW & AppContainer Security Capabilities
     STARTUPINFOEXW siex = { 0 };
     siex.StartupInfo.cb = sizeof(siex);
     std::wstring desktopName = L"winsta0\\default";
     siex.StartupInfo.lpDesktop = (LPWSTR)desktopName.c_str();
-
-    std::vector<BYTE> attrBuffer;
-    LPPROC_THREAD_ATTRIBUTE_LIST attrList = NULL;
-
-    DWORD attrCount = 0;
-    if (options.blockChildProcesses) attrCount++;
-    if (pipesCreated) attrCount++;
 
     std::vector<HANDLE> handlesToInherit;
     if (pipesCreated) {
@@ -773,56 +469,81 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         siex.StartupInfo.hStdInput = NULL;
     }
 
-    if (attrCount > 0) {
-        SIZE_T attrSize = 0;
-        InitializeProcThreadAttributeList(NULL, attrCount, 0, &attrSize);
-        if (attrSize > 0) {
-            attrBuffer.resize(attrSize);
-            attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuffer.data();
-            if (InitializeProcThreadAttributeList(attrList, attrCount, 0, &attrSize)) {
-                if (options.blockChildProcesses) {
-                    DWORD policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
-                    UpdateProcThreadAttribute(
-                        attrList,
-                        0,
-                        PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
-                        &policy,
-                        sizeof(policy),
-                        NULL,
-                        NULL);
-                }
-                if (!handlesToInherit.empty()) {
-                    UpdateProcThreadAttribute(
-                        attrList,
-                        0,
-                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                        handlesToInherit.data(),
-                        handlesToInherit.size() * sizeof(HANDLE),
-                        NULL,
-                        NULL);
-                }
-                siex.lpAttributeList = attrList;
+    // AppContainer Network Capabilities (internetClient & privateNetworkClientServer)
+    PSID pInternetClientSid = NULL;
+    PSID pPrivateNetworkSid = NULL;
+    ConvertStringSidToSidW(L"S-1-15-3-1", &pInternetClientSid);
+    ConvertStringSidToSidW(L"S-1-15-3-3", &pPrivateNetworkSid);
+
+    SID_AND_ATTRIBUTES caps[2] = { 0 };
+    DWORD capCount = 0;
+    if (pInternetClientSid) {
+        caps[capCount].Sid = pInternetClientSid;
+        caps[capCount].Attributes = SE_GROUP_ENABLED;
+        capCount++;
+    }
+    if (pPrivateNetworkSid) {
+        caps[capCount].Sid = pPrivateNetworkSid;
+        caps[capCount].Attributes = SE_GROUP_ENABLED;
+        capCount++;
+    }
+
+    SECURITY_CAPABILITIES sc = { 0 };
+    sc.AppContainerSid = pAppContainerSid;
+    sc.Capabilities = caps;
+    sc.CapabilityCount = capCount;
+
+    DWORD attrCount = 1; // PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
+    if (options.blockChildProcesses) attrCount++;
+    if (!handlesToInherit.empty()) attrCount++;
+
+    std::vector<BYTE> attrBuffer;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList = NULL;
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, attrCount, 0, &attrSize);
+
+    if (attrSize > 0) {
+        attrBuffer.resize(attrSize);
+        attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuffer.data();
+        if (InitializeProcThreadAttributeList(attrList, attrCount, 0, &attrSize)) {
+            // Attribute 1: AppContainer Security Capabilities
+            UpdateProcThreadAttribute(
+                attrList, 0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                &sc, sizeof(sc),
+                NULL, NULL
+            );
+
+            // Attribute 2: Child process restriction
+            if (options.blockChildProcesses) {
+                DWORD policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+                UpdateProcThreadAttribute(
+                    attrList, 0,
+                    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+                    &policy, sizeof(policy),
+                    NULL, NULL
+                );
             }
+
+            // Attribute 3: Handle inheritance list
+            if (!handlesToInherit.empty()) {
+                UpdateProcThreadAttribute(
+                    attrList, 0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    handlesToInherit.data(),
+                    handlesToInherit.size() * sizeof(HANDLE),
+                    NULL, NULL
+                );
+            }
+
+            siex.lpAttributeList = attrList;
         }
     }
 
-    // 3. Obtain restricted primary token
-    HANDLE hToken = NULL;
-    bool tokenRequested = (options.stripPrivileges || options.lowIntegrity || options.denyUserSid);
-    if (tokenRequested) {
-        hToken = CreateLowIntegrityRestrictedToken(options.stripPrivileges, options.lowIntegrity, options.denyUserSid, outError);
-        if (!hToken) {
-            // Token creation failed. Refuse to launch un-sandboxed process.
-            if (attrList) DeleteProcThreadAttributeList(attrList);
-            if (hChildStdOutWrite) CloseHandle(hChildStdOutWrite);
-            if (hChildStdErrWrite) CloseHandle(hChildStdErrWrite);
-            if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
-            if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
-            return false;
-        }
-    }
+    // 6. Tier A: Prepare isolated environment block
+    std::vector<wchar_t> envBlock = CreateAppContainerEnvironmentBlock(acFolder);
 
-    // 4. Configure process creation flags
+    // 7. Process Creation Flags
     DWORD creationFlags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
     if (options.startSuspended) {
         creationFlags |= CREATE_SUSPENDED;
@@ -832,133 +553,76 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     cmdLineBuf.push_back(L'\0');
 
     PROCESS_INFORMATION pi = { 0 };
-    BOOL success = FALSE;
 
-    if (hToken != NULL) {
-        success = CreateProcessAsUserW(
-            hToken,
-            applicationPath.empty() ? NULL : applicationPath.c_str(),
-            cmdLineBuf.data(),
-            NULL,
-            NULL,
-            pipesCreated ? TRUE : FALSE,
-            creationFlags,
-            NULL,
-            NULL,
-            &siex.StartupInfo,
-            &pi
-        );
-        if (!success) {
-            DWORD err = GetLastError();
-            outError = "CreateProcessAsUserW failed (code " + std::to_string(err) + ")";
-            if (!options.allowInsecureFallback) {
-                // Fail-Closed: Abort launch to prevent running with Medium/High IL
-                outError += ". Sandbox launch aborted to prevent untrusted process from running outside Low-Integrity sandbox.";
-                if (attrList) DeleteProcThreadAttributeList(attrList);
-                CloseHandle(hToken);
-                if (hChildStdOutWrite) CloseHandle(hChildStdOutWrite);
-                if (hChildStdErrWrite) CloseHandle(hChildStdErrWrite);
-                if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
-                if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
-                return false;
-            }
-            outError += ". [WARNING] Insecure fallback to CreateProcessW (Medium/High IL) allowed by configuration!";
-        } else {
-            outInfo.isLowIntegrity = options.lowIntegrity;
-            outInfo.privilegesStripped = options.stripPrivileges;
-            outInfo.userSidDenied = options.denyUserSid;
-        }
-    }
+    BOOL success = CreateProcessW(
+        resolvedAppPath.empty() ? NULL : resolvedAppPath.c_str(),
+        cmdLineBuf.data(),
+        NULL,
+        NULL,
+        pipesCreated ? TRUE : FALSE,
+        creationFlags,
+        envBlock.empty() ? NULL : envBlock.data(),
+        NULL,
+        &siex.StartupInfo,
+        &pi
+    );
+
+    // Clean up temporary setup objects
+    if (attrList) DeleteProcThreadAttributeList(attrList);
+    if (hChildStdOutWrite) CloseHandle(hChildStdOutWrite);
+    if (hChildStdErrWrite) CloseHandle(hChildStdErrWrite);
+    if (pInternetClientSid) LocalFree(pInternetClientSid);
+    if (pPrivateNetworkSid) LocalFree(pPrivateNetworkSid);
 
     if (!success) {
-        // Fallback to CreateProcessW only if token was not requested OR insecure fallback was explicitly permitted
-        success = CreateProcessW(
-            applicationPath.empty() ? NULL : applicationPath.c_str(),
-            cmdLineBuf.data(),
-            NULL,
-            NULL,
-            pipesCreated ? TRUE : FALSE,
-            creationFlags,
-            NULL,
-            NULL,
-            &siex.StartupInfo,
-            &pi
-        );
-        if (!success) {
-            outError = "CreateProcessW failed (code " + std::to_string(GetLastError()) + ")";
-            if (attrList) DeleteProcThreadAttributeList(attrList);
-            if (hToken) CloseHandle(hToken);
-            if (hChildStdOutWrite) CloseHandle(hChildStdOutWrite);
-            if (hChildStdErrWrite) CloseHandle(hChildStdErrWrite);
-            if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
-            if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
-            return false;
+        DWORD err = GetLastError();
+        outError = "CreateProcessW failed: " + std::to_string(err);
+        if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
+        if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
+        return false;
+    }
+
+    // 8. Assign to Job Object if requested
+    HANDLE hJob = NULL;
+    if (options.useJobObject) {
+        hJob = CreateJobObjectW(NULL, NULL);
+        if (hJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
+            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            jeli.BasicLimitInformation.ActiveProcessLimit = 1;
+            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+            AssignProcessToJobObject(hJob, pi.hProcess);
         }
-        outInfo.isLowIntegrity = false;
-        outInfo.privilegesStripped = false;
-    }
-
-    // Close parent's copies of write handles so EOF unblocks when child terminates
-    if (hChildStdOutWrite) {
-        CloseHandle(hChildStdOutWrite);
-        hChildStdOutWrite = NULL;
-    }
-    if (hChildStdErrWrite) {
-        CloseHandle(hChildStdErrWrite);
-        hChildStdErrWrite = NULL;
-    }
-
-    if (attrList) {
-        DeleteProcThreadAttributeList(attrList);
-    }
-    if (hToken) {
-        CloseHandle(hToken);
     }
 
     outInfo.hProcess = pi.hProcess;
     outInfo.hThread = pi.hThread;
     outInfo.processId = pi.dwProcessId;
     outInfo.threadId = pi.dwThreadId;
+    outInfo.hJob = hJob;
     outInfo.hStdOutRead = hChildStdOutRead;
     outInfo.hStdErrRead = hChildStdErrRead;
-
-    // 5. Assign to Job Object with ActiveProcessLimit = 1
-    if (options.useJobObject) {
-        HANDLE hJob = CreateJobObjectW(NULL, NULL);
-        if (hJob) {
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
-            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            jeli.BasicLimitInformation.ActiveProcessLimit = 1;
-            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-            AssignProcessToJobObject(hJob, pi.hProcess);
-            outInfo.hJob = hJob;
-        }
-    }
 
     return true;
 }
 
 bool SandboxLauncher::ResumeSandboxedProcess(SandboxProcessInfo& procInfo) {
-    if (procInfo.hThread) {
-        DWORD res = ResumeThread(procInfo.hThread);
-        return (res != (DWORD)-1);
-    }
-    return false;
+    if (procInfo.hThread == NULL) return false;
+    DWORD res = ResumeThread(procInfo.hThread);
+    return (res != (DWORD)-1);
 }
 
 void SandboxLauncher::CleanupProcessInfo(SandboxProcessInfo& procInfo) {
-    if (procInfo.hThread) {
-        CloseHandle(procInfo.hThread);
-        procInfo.hThread = NULL;
+    // Revoke granted registry subkeys cleanly upon termination (Tier B cleanup)
+    if (procInfo.pAppContainerSid) {
+        for (const auto& subKey : procInfo.grantedRegistryKeys) {
+            RevokeAppContainerRegistryAccess(HKEY_CURRENT_USER, subKey, procInfo.pAppContainerSid);
+        }
+        procInfo.grantedRegistryKeys.clear();
+        free(procInfo.pAppContainerSid);
+        procInfo.pAppContainerSid = NULL;
     }
-    if (procInfo.hProcess) {
-        CloseHandle(procInfo.hProcess);
-        procInfo.hProcess = NULL;
-    }
-    if (procInfo.hJob) {
-        CloseHandle(procInfo.hJob);
-        procInfo.hJob = NULL;
-    }
+
     if (procInfo.hStdOutRead) {
         CloseHandle(procInfo.hStdOutRead);
         procInfo.hStdOutRead = NULL;
@@ -967,86 +631,59 @@ void SandboxLauncher::CleanupProcessInfo(SandboxProcessInfo& procInfo) {
         CloseHandle(procInfo.hStdErrRead);
         procInfo.hStdErrRead = NULL;
     }
-    procInfo.processId = 0;
-    procInfo.threadId = 0;
-}
-
-static bool CheckFileExists(const std::wstring& path) {
-    DWORD dwAttrib = GetFileAttributesW(path.c_str());
-    return (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+    if (procInfo.hThread) {
+        CloseHandle(procInfo.hThread);
+        procInfo.hThread = NULL;
+    }
+    if (procInfo.hJob) {
+        CloseHandle(procInfo.hJob);
+        procInfo.hJob = NULL;
+    }
+    if (procInfo.hProcess) {
+        CloseHandle(procInfo.hProcess);
+        procInfo.hProcess = NULL;
+    }
 }
 
 std::wstring SandboxLauncher::AutoDetectRealJava(const std::string& configuredPath, bool preferConsole) {
-    // 1. If configuredPath is provided and valid, use it
     if (!configuredPath.empty()) {
-        std::wstring wPath = util::Utf8ToWide(configuredPath);
-        if (CheckFileExists(wPath)) {
-            if (preferConsole) {
-                // If it ends with javaw.exe, try sibling java.exe so console probes produce stdout
-                size_t pos = wPath.rfind(L"javaw.exe");
-                if (pos != std::wstring::npos) {
-                    std::wstring consoleJava = wPath.substr(0, pos) + L"java.exe";
-                    if (CheckFileExists(consoleJava)) return consoleJava;
-                }
-            } else {
-                // If it ends with java.exe, try sibling javaw.exe
-                size_t pos = wPath.rfind(L"java.exe");
-                if (pos != std::wstring::npos && (pos == 0 || wPath[pos - 1] != L'w')) {
-                    std::wstring guiJava = wPath.substr(0, pos) + L"javaw.exe";
-                    if (CheckFileExists(guiJava)) return guiJava;
-                }
-            }
-            return wPath;
+        std::wstring wConfigured = util::Utf8ToWide(configuredPath);
+        if (GetFileAttributesW(wConfigured.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return wConfigured;
         }
     }
 
-    // 2. Check JAVA_HOME environment variable
-    wchar_t javaHome[MAX_PATH] = { 0 };
-    if (GetEnvironmentVariableW(L"JAVA_HOME", javaHome, MAX_PATH) > 0) {
-        std::wstring target = std::wstring(javaHome) + (preferConsole ? L"\\bin\\java.exe" : L"\\bin\\javaw.exe");
-        if (CheckFileExists(target)) return target;
-        std::wstring fallback = std::wstring(javaHome) + (preferConsole ? L"\\bin\\javaw.exe" : L"\\bin\\java.exe");
-        if (CheckFileExists(fallback)) return fallback;
+    std::wstring targetBinary = preferConsole ? L"java.exe" : L"javaw.exe";
+
+    wchar_t javaHomeBuf[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableW(L"JAVA_HOME", javaHomeBuf, MAX_PATH) > 0) {
+        std::wstring candidate = std::wstring(javaHomeBuf) + L"\\bin\\" + targetBinary;
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return candidate;
+        }
     }
 
-    // 3. Scan common standard JDK installation locations
-    const std::wstring searchRoots[] = {
-        L"C:\\Program Files\\Microsoft\\",
-        L"C:\\Program Files\\Eclipse Adoptium\\",
-        L"C:\\Program Files\\Java\\",
-        L"C:\\Program Files\\BellSoft\\",
-        L"C:\\Program Files\\Zulu\\"
+    std::vector<std::wstring> wellKnownRoots = {
+        L"C:\\Program Files\\Java",
+        L"C:\\Program Files\\Eclipse Adoptium",
+        L"C:\\Program Files\\Microsoft",
+        L"C:\\Program Files\\BellSoft",
+        L"C:\\Program Files\\Amazon Corretto",
+        L"C:\\Program Files\\Zulu"
     };
 
-    std::wstring bestCandidate;
-    int bestVersion = 0;
-
-    for (const auto& root : searchRoots) {
-        std::wstring searchPattern = root + L"*";
+    for (const auto& root : wellKnownRoots) {
+        std::wstring searchPattern = root + L"\\*";
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                     if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-                    std::wstring candidate = root + fd.cFileName + (preferConsole ? L"\\bin\\java.exe" : L"\\bin\\javaw.exe");
-                    if (CheckFileExists(candidate)) {
-                        int ver = 0;
-                        const wchar_t* p = wcsstr(fd.cFileName, L"jdk-");
-                        if (!p) p = wcsstr(fd.cFileName, L"jdk");
-                        if (p) {
-                            while (*p && (*p < L'0' || *p > L'9')) p++;
-                            if (*p) ver = _wtoi(p);
-                        }
-                        if (ver == 21) {
-                            // Java 21 is modern Minecraft's target LTS version
-                            FindClose(hFind);
-                            return candidate;
-                        }
-                        if (ver > bestVersion || bestCandidate.empty()) {
-                            bestVersion = ver;
-                            bestCandidate = candidate;
-                        }
+                    std::wstring candidate = root + L"\\" + fd.cFileName + L"\\bin\\" + targetBinary;
+                    if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        FindClose(hFind);
+                        return candidate;
                     }
                 }
             } while (FindNextFileW(hFind, &fd));
@@ -1054,66 +691,34 @@ std::wstring SandboxLauncher::AutoDetectRealJava(const std::string& configuredPa
         }
     }
 
-    if (!bestCandidate.empty()) {
-        return bestCandidate;
-    }
-
-    // 4. Check system PATH
-    wchar_t pathBuf[MAX_PATH] = { 0 };
-    if (SearchPathW(NULL, preferConsole ? L"java.exe" : L"javaw.exe", NULL, MAX_PATH, pathBuf, NULL) > 0) {
-        wchar_t currentExe[MAX_PATH] = { 0 };
-        GetModuleFileNameW(NULL, currentExe, MAX_PATH);
-        if (_wcsicmp(pathBuf, currentExe) != 0) {
-            return std::wstring(pathBuf);
-        }
-    }
-
-    return preferConsole ? L"java.exe" : L"javaw.exe";
+    return targetBinary;
 }
 
 int SandboxLauncher::RunJavaProbe(const std::wstring& javaExe, int argc, char* argv[]) {
     std::wstring cmdLine = L"\"" + javaExe + L"\"";
     for (int i = 1; i < argc; ++i) {
-        std::wstring wArg = util::Utf8ToWide(argv[i]);
-        if (wArg.find(L' ') != std::wstring::npos) {
-            cmdLine += L" \"" + wArg + L"\"";
-        } else {
-            cmdLine += L" " + wArg;
+        std::string arg = argv[i];
+        if (arg != "run" && arg != "sandbox" && arg != "--") {
+            cmdLine += L" " + util::Utf8ToWide(arg);
         }
     }
 
-    STARTUPINFOW si = { 0 };
-    si.cb = sizeof(si);
-    GetStartupInfoW(&si);
-
+    STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
+
     std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
     cmdBuf.push_back(L'\0');
 
-    // Launch real java with handle inheritance enabled so output streams directly to caller (HMCL)
-    BOOL ok = CreateProcessW(
-        NULL,
-        cmdBuf.data(),
-        NULL,
-        NULL,
-        TRUE,
-        0,
-        NULL,
-        NULL,
-        &si,
-        &pi
-    );
-
-    if (!ok) {
+    if (!CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         return 1;
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
 
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return (int)exitCode;
 }
 

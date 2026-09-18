@@ -83,5 +83,17 @@
       "%USERPROFILE%\\.ssh",
       "%USERPROFILE%\\Desktop"
     ]
+  },
+  "appcontainer": {
+    "enabled": true,
+    "profile_name": "MCGuard.Sandbox",
+    "allowed_hkcu_keys": [
+      "Software\\JavaSoft"
+    ],
+    "enable_broker": true,
+    "broker_allowed_keys": [
+      "Software\\JavaSoft",
+      "Environment"
+    ]
   }
 }

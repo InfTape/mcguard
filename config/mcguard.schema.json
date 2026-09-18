@@ -126,6 +126,25 @@
           "description": "List of private files or directories to protect with Windows Mandatory Integrity Control (MIC) No-Read-Up & No-Write-Up (NRNW). Low-Integrity sandboxed Minecraft/Mods are strictly denied read and write access."
         }
       }
+    },
+    "appcontainer": {
+      "type": "object",
+      "description": "Windows AppContainer Sandbox Isolation and HKCU Registry Protection Settings",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Enable Windows AppContainer Isolation for Minecraft/JVM" },
+        "profile_name": { "type": "string", "description": "AppContainer profile name (e.g. MCGuard.Sandbox)" },
+        "allowed_hkcu_keys": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Explicit list of HKCU subkeys granted read-only access for AppContainer SID (Tier B). HKCU root and Software root are never exposed."
+        },
+        "enable_broker": { "type": "boolean", "description": "Enable Named Pipe IPC Broker for mediated sensitive queries (Tier C)" },
+        "broker_allowed_keys": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Whitelisted registry/environment keys the Broker will return to the sandbox."
+        }
+      }
     }
   },
   "required": ["network"]

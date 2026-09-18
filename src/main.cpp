@@ -13,6 +13,7 @@
 #include "core/process_watcher.h"
 #include "core/wfp_guard.h"
 #include "core/sandbox_launcher.h"
+#include "core/ipc_broker.h"
 #include "core/etw_watcher.h"
 #include "core/network_tracker.h"
 #include "core/folder_watcher.h"
@@ -31,19 +32,10 @@ static core::NetworkTracker* g_pNetTracker = nullptr;
 static core::FolderWatcher* g_pFolderWatcher = nullptr;
 
 // Global protected paths tracking for Clean Exit restoration
-static std::vector<std::wstring> g_appliedProtectedPaths;
-static std::wstring g_protectedGameDir;
-static bool g_restoreOnExit = true;
-
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
         std::cout << "\n[*] Shutting down MCGuard cleanly...\n";
         g_exitRequested = true;
-        if (g_restoreOnExit && !g_appliedProtectedPaths.empty()) {
-            std::cout << "[*] Restoring protected paths to default Windows integrity level...\n";
-            core::SandboxLauncher::RestoreProtectedPaths(g_appliedProtectedPaths, g_protectedGameDir);
-            g_appliedProtectedPaths.clear();
-        }
         if (g_pWfp) g_pWfp->Shutdown();
         if (g_pEtw) g_pEtw->Stop();
         if (g_pNetTracker) g_pNetTracker->StopPolling();
@@ -748,56 +740,36 @@ int main(int argc, char* argv[]) {
             view.PrintStatus("Detected .minecraft Root: " + util::WideToUtf8(mcRoot));
         }
 
-        // 2. Prepare Sandbox Options
+        // 2. Prepare Sandbox Options (Windows AppContainer Architecture)
         core::SandboxOptions sbOptions;
+        sbOptions.useAppContainer = cfg.appContainer.enabled;
+        sbOptions.appContainerName = util::Utf8ToWide(cfg.appContainer.profileName);
+        sbOptions.enableBroker = cfg.appContainer.enableBroker;
         sbOptions.blockChildProcesses = cfg.sandbox.blockChildProcesses;
-        sbOptions.lowIntegrity = cfg.sandbox.lowIntegrity;
-        sbOptions.stripPrivileges = cfg.sandbox.stripPrivileges;
         sbOptions.useJobObject = cfg.sandbox.useJobObject;
-        sbOptions.denyUserSid = cfg.sandbox.denyUserSid;
         sbOptions.startSuspended = true;
         sbOptions.gameDir = gameDir;
 
-        if (sbOptions.denyUserSid) {
-            view.PrintSuccess("Sandbox Architecture: Deny-Only User SID (Kernel Default-Deny on private user profile)");
-            LogLauncherDiag("Sandbox Architecture: Deny-Only User SID Active.");
-            for (const auto& p : cfg.protectedPaths) {
-                if (p.empty()) continue;
-                std::wstring wPath = util::Utf8ToWide(p);
-                wchar_t expBuf[MAX_PATH * 4] = { 0 };
-                ExpandEnvironmentStringsW(wPath.c_str(), expBuf, sizeof(expBuf) / sizeof(expBuf[0]));
-                std::string u8Path = util::WideToUtf8(expBuf);
-                cfg.sensitivePatterns.push_back(u8Path);
-                size_t lastSlash = u8Path.find_last_of("\\/");
-                if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
-                    cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
-                }
-            }
-        } else if (!cfg.protectedPaths.empty()) {
-            // Legacy NRNW tagging mode
-            std::wstring excludeDir = !mcRoot.empty() ? mcRoot : gameDir;
-            std::vector<std::wstring> appliedPaths;
-            core::SandboxLauncher::ApplyProtectedPaths(cfg.protectedPaths, appliedPaths, excludeDir);
-            sbOptions.protectedPaths = appliedPaths;
-            g_appliedProtectedPaths = appliedPaths;
-            g_protectedGameDir = excludeDir;
-            g_restoreOnExit = cfg.sandbox.restoreOnExit;
+        for (const auto& k : cfg.appContainer.allowedHkcuKeys) {
+            sbOptions.allowedHkcuSubkeys.push_back(util::Utf8ToWide(k));
+        }
+        for (const auto& f : cfg.allowedFolders) {
+            sbOptions.additionalAllowedFolders.push_back(util::Utf8ToWide(f));
+        }
 
-            for (const auto& appPath : appliedPaths) {
-                std::string u8Path = util::WideToUtf8(appPath);
-                LogLauncherDiag("Kernel NRNW Protection applied: " + u8Path);
-                view.PrintSuccess("Protected Path [NRNW Active]: " + u8Path);
+        view.PrintSuccess("Sandbox Architecture: Windows AppContainer Isolation (" + cfg.appContainer.profileName + ")");
+        LogLauncherDiag("Sandbox Architecture: Windows AppContainer Profile=" + cfg.appContainer.profileName);
 
-                // Add to sensitivePatterns for ETW detection and alerting
-                DWORD dwAttr = GetFileAttributesW(appPath.c_str());
-                bool isDirectory = (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY));
-                cfg.sensitivePatterns.push_back(u8Path);
-                if (!isDirectory) {
-                    size_t lastSlash = u8Path.find_last_of("\\/");
-                    if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
-                        cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
-                    }
-                }
+        for (const auto& p : cfg.protectedPaths) {
+            if (p.empty()) continue;
+            std::wstring wPath = util::Utf8ToWide(p);
+            wchar_t expBuf[MAX_PATH * 4] = { 0 };
+            ExpandEnvironmentStringsW(wPath.c_str(), expBuf, sizeof(expBuf) / sizeof(expBuf[0]));
+            std::string u8Path = util::WideToUtf8(expBuf);
+            cfg.sensitivePatterns.push_back(u8Path);
+            size_t lastSlash = u8Path.find_last_of("\\/");
+            if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
+                cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
             }
         }
 
@@ -814,7 +786,7 @@ int main(int argc, char* argv[]) {
                 wfpActive = true;
                 LogLauncherDiag("Administrator privileges detected. WFP ALE Engine initialized directly.");
             }
-        } else {
+        } else if (requestElevate) {
             // Standard user rights: Request UAC elevation to activate WFP ALE Engine
             LogLauncherDiag("Standard user rights detected. Requesting UAC elevation for WFP ALE Engine...");
 
@@ -911,25 +883,27 @@ int main(int argc, char* argv[]) {
         }
 
         LogLauncherDiag("Sandbox launch SUCCESS. Sandboxed PID=" + std::to_string(procInfo.processId));
-        view.PrintSuccess("Process created inside Sandbox (PID: " + std::to_string(procInfo.processId) + ")");
-        if (procInfo.isLowIntegrity) {
-            view.PrintStatus("Integrity Level: LOW (S-1-16-4096) - Write access denied to system/user folders");
-        } else if (sbOptions.lowIntegrity) {
-            view.PrintWarning("Integrity Level: MEDIUM (Low IL fallback occurred! Process NOT restricted to Low IL)");
+        view.PrintSuccess("Process created inside AppContainer Sandbox (PID: " + std::to_string(procInfo.processId) + ")");
+        if (!procInfo.appContainerSidStr.empty()) {
+            view.PrintStatus("AppContainer SID: " + util::WideToUtf8(procInfo.appContainerSidStr));
         }
-        if (procInfo.privilegesStripped) {
-            view.PrintStatus("Privileges: STRIPPED (DISABLE_MAX_PRIVILEGE)");
-        } else if (sbOptions.stripPrivileges) {
-            view.PrintWarning("Privileges: UNMODIFIED (Privilege stripping fallback occurred)");
+        if (!procInfo.appContainerFolder.empty()) {
+            view.PrintStatus("Tier A (Storage): %LOCALAPPDATA% & %TEMP% -> " + util::WideToUtf8(procInfo.appContainerFolder));
         }
-        if (procInfo.userSidDenied) {
-            view.PrintSuccess("User Profile Access: DEFAULT DENIED (Zero disk SACL tagging, Desktop/Documents blocked)");
-        }
+        view.PrintStatus("Tier B (Registry): Whitelisted HKCU Subkeys: " + std::to_string(procInfo.grantedRegistryKeys.size()) + " keys (e.g. Software\\JavaSoft)");
         if (sbOptions.blockChildProcesses) {
             view.PrintStatus("Child Process Policy: RESTRICTED - Kernel forbids cmd.exe/powershell creation");
         }
         if (sbOptions.useJobObject) {
             view.PrintStatus("Job Object Limit: ActiveProcessLimit = 1 (Breakout blocked)");
+        }
+
+        // Tier C: Start IPC Broker for mediated queries if enabled
+        core::IpcBroker ipcBroker;
+        if (cfg.appContainer.enableBroker && procInfo.pAppContainerSid) {
+            if (ipcBroker.Start(procInfo.pAppContainerSid, "\\\\.\\pipe\\mcguard_ipc", cfg.appContainer.brokerAllowedKeys)) {
+                view.PrintSuccess("Tier C (Broker): Named Pipe \\\\.\\pipe\\mcguard_ipc active for mediated queries");
+            }
         }
 
         // Forward child process stdout and stderr back to the caller (e.g. HMCL / terminal)
@@ -1250,14 +1224,11 @@ int main(int argc, char* argv[]) {
         if (stdoutForwarder.joinable()) stdoutForwarder.join();
         if (stderrForwarder.joinable()) stderrForwarder.join();
 
-        core::SandboxLauncher::CleanupProcessInfo(procInfo);
-
-        if (!sbOptions.denyUserSid && cfg.sandbox.restoreOnExit && !sbOptions.protectedPaths.empty()) {
-            view.PrintStatus("Restoring protected paths to default Windows integrity level (Clean Exit)...");
-            core::SandboxLauncher::RestoreProtectedPaths(sbOptions.protectedPaths, gameDir);
-            view.PrintSuccess("Protected paths restored cleanly.");
-            g_appliedProtectedPaths.clear();
+        if (cfg.appContainer.enableBroker) {
+            ipcBroker.Stop();
         }
+
+        core::SandboxLauncher::CleanupProcessInfo(procInfo);
 
         view.PrintSuccess("MCGuard Sandbox session ended cleanly.");
         return (int)sandboxedExitCode;
