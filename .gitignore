@@ -1,10 +1,16 @@
 # Build output
 *.obj
 *.exe
+*.dll
 *.pdb
 *.ilk
 *.idb
 *.res
+*.lib
+*.exp
+deps/
+fabric-sandbox/
+jdk.zipfs/
 
 # Audit logs
 *.jsonl

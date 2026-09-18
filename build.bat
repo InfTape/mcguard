@@ -19,6 +19,21 @@ if %errorlevel% neq 0 (
     exit /b %errorlevel%
 )
 
+echo [*] Compiling mcguard_hook.dll (Detours hooks)...
+cl.exe /std:c++17 /EHsc /O2 /W3 /LD /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 ^
+    /I"%~dp0deps\detours\src" ^
+    "%~dp0src\hook\mcguard_hook.cpp" ^
+    "%~dp0deps\detours\src\detours.cpp" ^
+    "%~dp0deps\detours\src\modules.cpp" ^
+    "%~dp0deps\detours\src\disasm.cpp" ^
+    "%~dp0deps\detours\src\image.cpp" ^
+    /link /out:"%~dp0mcguard_hook.dll" User32.lib Advapi32.lib
+
+if %errorlevel% neq 0 (
+    echo [-] Failed to compile mcguard_hook.dll!
+    exit /b %errorlevel%
+)
+
 echo [*] Compiling Standalone MCGuard.exe...
 cl.exe /std:c++17 /EHsc /O2 /W3 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 ^
     /I"%~dp0src" ^

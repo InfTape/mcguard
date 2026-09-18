@@ -9,6 +9,7 @@
 #include <map>
 #include <userenv.h>
 #include <combaseapi.h>
+#include <sddl.h>
 
 #pragma comment(lib, "Userenv.lib")
 #pragma comment(lib, "Advapi32.lib")
@@ -261,6 +262,12 @@ bool SandboxLauncher::GrantAppContainerFileAccess(
 ) {
     if (targetPath.empty() || !pSid) return false;
 
+    // Expand generic access bits to concrete file rights for NTFS AccessCheck
+    if (accessMask & GENERIC_ALL) accessMask |= FILE_ALL_ACCESS;
+    if (accessMask & GENERIC_READ) accessMask |= FILE_GENERIC_READ;
+    if (accessMask & GENERIC_WRITE) accessMask |= FILE_GENERIC_WRITE;
+    if (accessMask & GENERIC_EXECUTE) accessMask |= FILE_GENERIC_EXECUTE;
+
     PACL pOldDacl = NULL;
     PSECURITY_DESCRIPTOR pSD = NULL;
     DWORD res = GetNamedSecurityInfoW(
@@ -387,6 +394,96 @@ static std::vector<wchar_t> CreateAppContainerEnvironmentBlock(const std::wstrin
     return result;
 }
 
+static bool SetLowIntegrityLabel(const std::wstring& path) {
+    if (path.empty()) return false;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"S:(ML;OICI;NW;;;LW)",
+            SDDL_REVISION_1,
+            &pSD,
+            NULL)) {
+        return false;
+    }
+
+    PACL pSacl = NULL;
+    BOOL bSaclPresent = FALSE, bSaclDefaulted = FALSE;
+    if (GetSecurityDescriptorSacl(pSD, &bSaclPresent, &pSacl, &bSaclDefaulted) && pSacl) {
+        SetNamedSecurityInfoW(
+            (LPWSTR)path.c_str(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            NULL, NULL, NULL,
+            pSacl
+        );
+    }
+    LocalFree(pSD);
+    return true;
+}
+
+static void CleanStaleFabricTmpFiles(const std::wstring& root) {
+    if (root.empty()) return;
+    std::wstring remappedDir = root;
+    if (remappedDir.back() != L'\\') remappedDir += L'\\';
+    remappedDir += L".fabric\\remappedJars\\*";
+
+    WIN32_FIND_DATAW ffd;
+    HANDLE hFind = FindFirstFileW(remappedDir.c_str(), &ffd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                wcscmp(ffd.cFileName, L".") != 0 && wcscmp(ffd.cFileName, L"..") != 0) {
+                std::wstring subDir = root;
+                if (subDir.back() != L'\\') subDir += L'\\';
+                subDir += L".fabric\\remappedJars\\" + std::wstring(ffd.cFileName) + L"\\*.tmp";
+                WIN32_FIND_DATAW subFfd;
+                HANDLE hSubFind = FindFirstFileW(subDir.c_str(), &subFfd);
+                if (hSubFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!(subFfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                            std::wstring tmpFile = root;
+                            if (tmpFile.back() != L'\\') tmpFile += L'\\';
+                            tmpFile += L".fabric\\remappedJars\\" + std::wstring(ffd.cFileName) + L"\\" + subFfd.cFileName;
+                            DeleteFileW(tmpFile.c_str());
+                        }
+                    } while (FindNextFileW(hSubFind, &subFfd));
+                    FindClose(hSubFind);
+                }
+            } else if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::wstring fn = ffd.cFileName;
+                if (fn.length() >= 4 && fn.substr(fn.length() - 4) == L".tmp") {
+                    std::wstring tmpFile = root;
+                    if (tmpFile.back() != L'\\') tmpFile += L'\\';
+                    tmpFile += L".fabric\\remappedJars\\" + fn;
+                    DeleteFileW(tmpFile.c_str());
+                }
+            }
+        } while (FindNextFileW(hFind, &ffd));
+        FindClose(hFind);
+    }
+}
+
+static void EnsureVolProbeFile(const std::wstring& root, PSID pSid) {
+    if (root.empty() || !pSid) return;
+    std::wstring volFile = root;
+    if (volFile.back() != L'\\') volFile += L'\\';
+    volFile += L".mcguard_vol";
+
+    HANDLE h = CreateFileW(
+        volFile.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+        SandboxLauncher::GrantAppContainerFileAccess(volFile, pSid, FILE_ALL_ACCESS | GENERIC_ALL, false);
+        SetLowIntegrityLabel(volFile);
+    }
+}
+
 bool SandboxLauncher::LaunchSandboxedProcess(
     const std::wstring& applicationPath,
     const std::wstring& commandLine,
@@ -456,11 +553,13 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     if (!options.gameDir.empty()) {
         GrantAncestorsTraverseAccess(options.gameDir, pAppContainerSid);
         GrantAppContainerFileAccess(options.gameDir, pAppContainerSid, GENERIC_ALL, true);
+        SetLowIntegrityLabel(options.gameDir);
     }
 
     if (!mcRoot.empty()) {
         GrantAncestorsTraverseAccess(mcRoot, pAppContainerSid);
         GrantAppContainerFileAccess(mcRoot, pAppContainerSid, GENERIC_ALL, true);
+        SetLowIntegrityLabel(mcRoot);
 
         // Explicitly ensure critical subdirectories have inherited full access
         static const std::vector<std::wstring> s_mcSubDirs = {
@@ -473,8 +572,15 @@ bool SandboxLauncher::LaunchSandboxedProcess(
             subPath += sub;
             if (GetFileAttributesW(subPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 GrantAppContainerFileAccess(subPath, pAppContainerSid, GENERIC_ALL, true);
+                SetLowIntegrityLabel(subPath);
             }
         }
+
+        // Clean stale tiny-remapper temporary files from previous interrupted runs
+        CleanStaleFabricTmpFiles(mcRoot);
+
+        // Ensure .mcguard_vol probe file exists for GetVolumeInformationByHandleW fallback
+        EnsureVolProbeFile(mcRoot, pAppContainerSid);
     }
 
     // Map Virtual Drive for mcRoot to bypass Windows parent traverse limitations for AppContainers
@@ -493,6 +599,58 @@ bool SandboxLauncher::LaunchSandboxedProcess(
                 effectiveWorkingDir = mappedDrive + L"\\";
             }
         }
+    }
+
+    // Locate mcguard_hook.dll and configure JVM agent / tmp redirection
+    wchar_t exePathBuf[MAX_PATH] = { 0 };
+    GetModuleFileNameW(NULL, exePathBuf, MAX_PATH);
+    std::wstring exeDir = exePathBuf;
+    size_t lastBackslash = exeDir.find_last_of(L"\\/");
+    if (lastBackslash != std::wstring::npos) {
+        exeDir = exeDir.substr(0, lastBackslash);
+    }
+    std::wstring hookDllPath = exeDir + L"\\mcguard_hook.dll";
+
+    std::wstring extraJvmArgs;
+    if (GetFileAttributesW(hookDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        GrantAppContainerFileAccess(hookDllPath, pAppContainerSid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE, false);
+        extraJvmArgs += L" \"-agentpath:" + hookDllPath + L"\"";
+    }
+
+    if (!outInfo.virtualDriveLetter.empty()) {
+        std::wstring tempDir = outInfo.virtualDriveLetter + L"\\temp";
+        std::wstring jnaTmpDir = tempDir + L"\\bin";
+        CreateDirectoryW((mcRoot + L"\\temp").c_str(), NULL);
+        CreateDirectoryW((mcRoot + L"\\temp\\bin").c_str(), NULL);
+        GrantAppContainerFileAccess(mcRoot + L"\\temp", pAppContainerSid, GENERIC_ALL, true);
+        SetLowIntegrityLabel(mcRoot + L"\\temp");
+        GrantAppContainerFileAccess(mcRoot + L"\\temp\\bin", pAppContainerSid, GENERIC_ALL, true);
+        SetLowIntegrityLabel(mcRoot + L"\\temp\\bin");
+
+        if (effectiveCmdLine.find(L"-Djava.io.tmpdir=") == std::wstring::npos) {
+            extraJvmArgs += L" -Djava.io.tmpdir=\"" + tempDir + L"\"";
+        }
+        if (effectiveCmdLine.find(L"-Djna.tmpdir=") == std::wstring::npos) {
+            extraJvmArgs += L" -Djna.tmpdir=\"" + jnaTmpDir + L"\"";
+        }
+    }
+
+    if (!extraJvmArgs.empty()) {
+        size_t insertPos = 0;
+        if (!effectiveCmdLine.empty() && effectiveCmdLine[0] == L'\"') {
+            size_t q2 = effectiveCmdLine.find(L'\"', 1);
+            if (q2 != std::wstring::npos) {
+                insertPos = q2 + 1;
+            }
+        } else {
+            size_t space = effectiveCmdLine.find(L' ');
+            if (space != std::wstring::npos) {
+                insertPos = space;
+            } else {
+                insertPos = effectiveCmdLine.length();
+            }
+        }
+        effectiveCmdLine.insert(insertPos, extraJvmArgs);
     }
 
     // Grant Java runtime access

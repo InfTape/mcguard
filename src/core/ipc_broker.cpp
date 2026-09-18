@@ -171,6 +171,49 @@ std::string IpcBroker::ProcessRequest(const std::string& req) {
         return res + "\n";
     }
 
+    // Check for clip_cursor action
+    if (req.find("\"clip_cursor\"") != std::string::npos) {
+        if (req.find("\"has_rect\":false") != std::string::npos || req.find("\"has_rect\": false") != std::string::npos) {
+            ::ClipCursor(NULL);
+        } else {
+            auto extractIntField = [](const std::string& src, const std::string& field) -> int {
+                std::string pat = "\"" + field + "\"";
+                size_t p = src.find(pat);
+                if (p == std::string::npos) return 0;
+                size_t col = src.find(':', p);
+                if (col == std::string::npos) return 0;
+                size_t start = col + 1;
+                while (start < src.length() && (src[start] == ' ' || src[start] == '\t')) start++;
+                return std::atoi(src.c_str() + start);
+            };
+            RECT rc;
+            rc.left = extractIntField(req, "left");
+            rc.top = extractIntField(req, "top");
+            rc.right = extractIntField(req, "right");
+            rc.bottom = extractIntField(req, "bottom");
+            ::ClipCursor(&rc);
+        }
+        return "{\"status\":\"ok\"}\n";
+    }
+
+    // Check for set_cursor_pos action
+    if (req.find("\"set_cursor_pos\"") != std::string::npos) {
+        auto extractIntField = [](const std::string& src, const std::string& field) -> int {
+            std::string pat = "\"" + field + "\"";
+            size_t p = src.find(pat);
+            if (p == std::string::npos) return 0;
+            size_t col = src.find(':', p);
+            if (col == std::string::npos) return 0;
+            size_t start = col + 1;
+            while (start < src.length() && (src[start] == ' ' || src[start] == '\t')) start++;
+            return std::atoi(src.c_str() + start);
+        };
+        int x = extractIntField(req, "x");
+        int y = extractIntField(req, "y");
+        ::SetCursorPos(x, y);
+        return "{\"status\":\"ok\"}\n";
+    }
+
     return "{\"status\":\"bad_request\",\"error\":\"Unknown action\"}\n";
 }
 
@@ -178,7 +221,7 @@ void IpcBroker::HandleClient(HANDLE hPipe) {
     char buf[4096] = { 0 };
     DWORD bytesRead = 0;
 
-    if (ReadFile(hPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+    while (m_running && ReadFile(hPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
         buf[bytesRead] = '\0';
         std::string response = ProcessRequest(buf);
         DWORD bytesWritten = 0;
