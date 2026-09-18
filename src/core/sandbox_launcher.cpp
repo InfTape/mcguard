@@ -307,44 +307,6 @@ bool SandboxLauncher::GrantAppContainerFileAccess(
     return (res == ERROR_SUCCESS);
 }
 
-void SandboxLauncher::GrantAncestorsTraverseAccess(
-    const std::wstring& targetPath,
-    PSID pSid
-) {
-    if (targetPath.empty() || !pSid) return;
-
-    wchar_t userProfileBuf[MAX_PATH] = { 0 };
-    std::wstring wProfile;
-    if (GetEnvironmentVariableW(L"USERPROFILE", userProfileBuf, MAX_PATH) > 0) {
-        wProfile = userProfileBuf;
-        for (auto& ch : wProfile) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
-        while (!wProfile.empty() && wProfile.back() == L'\\') wProfile.pop_back();
-    }
-
-    std::wstring path = targetPath;
-    while (!path.empty() && path.length() > 3) {
-        size_t lastSlash = path.find_last_of(L"\\/");
-        if (lastSlash == std::wstring::npos || lastSlash <= 2) break;
-        path = path.substr(0, lastSlash);
-
-        std::wstring norm = path;
-        for (auto& ch : norm) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
-        while (!norm.empty() && norm.back() == L'\\') norm.pop_back();
-
-        // Boundary: Do not grant on C:\ or C:\Users
-        if (norm.length() <= 3 || norm.rfind(L"\\users") == norm.length() - 6) {
-            break;
-        }
-
-        // Grant traverse (non-inheritable)
-        GrantAppContainerFileAccess(path, pSid, FILE_GENERIC_READ | FILE_TRAVERSE, false);
-
-        if (!wProfile.empty() && norm == wProfile) {
-            break;
-        }
-    }
-}
-
 // Build environment block redirecting LOCALAPPDATA, TEMP, TMP to AppContainer storage (Tier A)
 static std::vector<wchar_t> CreateAppContainerEnvironmentBlock(const std::wstring& acFolder) {
     std::vector<wchar_t> result;
@@ -551,13 +513,11 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     }
 
     if (!options.gameDir.empty()) {
-        GrantAncestorsTraverseAccess(options.gameDir, pAppContainerSid);
         GrantAppContainerFileAccess(options.gameDir, pAppContainerSid, GENERIC_ALL, true);
         SetLowIntegrityLabel(options.gameDir);
     }
 
     if (!mcRoot.empty()) {
-        GrantAncestorsTraverseAccess(mcRoot, pAppContainerSid);
         GrantAppContainerFileAccess(mcRoot, pAppContainerSid, GENERIC_ALL, true);
         SetLowIntegrityLabel(mcRoot);
 
@@ -613,8 +573,19 @@ bool SandboxLauncher::LaunchSandboxedProcess(
 
     std::wstring extraJvmArgs;
     if (GetFileAttributesW(hookDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        GrantAppContainerFileAccess(hookDllPath, pAppContainerSid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE, false);
-        extraJvmArgs += L" \"-agentpath:" + hookDllPath + L"\"";
+        std::wstring agentDllTarget = hookDllPath;
+        if (!outInfo.virtualDriveLetter.empty()) {
+            std::wstring destHook = mcRoot;
+            if (destHook.back() != L'\\') destHook += L'\\';
+            destHook += L"mcguard_hook.dll";
+            CopyFileW(hookDllPath.c_str(), destHook.c_str(), FALSE);
+            GrantAppContainerFileAccess(destHook, pAppContainerSid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE, false);
+            SetLowIntegrityLabel(destHook);
+            agentDllTarget = outInfo.virtualDriveLetter + L"\\mcguard_hook.dll";
+        } else {
+            GrantAppContainerFileAccess(hookDllPath, pAppContainerSid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE, false);
+        }
+        extraJvmArgs += L" \"-agentpath:" + agentDllTarget + L"\"";
     }
 
     if (!outInfo.virtualDriveLetter.empty()) {
@@ -655,7 +626,6 @@ bool SandboxLauncher::LaunchSandboxedProcess(
 
     // Grant Java runtime access
     if (!resolvedAppPath.empty()) {
-        GrantAncestorsTraverseAccess(resolvedAppPath, pAppContainerSid);
         std::wstring javaHome = GetJavaHomeFromPath(resolvedAppPath);
         if (!javaHome.empty()) {
             GrantAppContainerFileAccess(javaHome, pAppContainerSid, GENERIC_READ | GENERIC_EXECUTE, true);
@@ -669,7 +639,6 @@ bool SandboxLauncher::LaunchSandboxedProcess(
 
     // Additional user-configured folders
     for (const auto& extraFolder : options.additionalAllowedFolders) {
-        GrantAncestorsTraverseAccess(extraFolder, pAppContainerSid);
         GrantAppContainerFileAccess(extraFolder, pAppContainerSid, GENERIC_READ, true);
     }
 

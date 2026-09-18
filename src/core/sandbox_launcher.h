@@ -107,11 +107,6 @@ public:
         DWORD accessMask,
         bool inherit = true
     );
-
-    static void GrantAncestorsTraverseAccess(
-        const std::wstring& targetPath,
-        PSID pSid
-    );
 };
 
 } // namespace core
