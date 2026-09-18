@@ -51,7 +51,7 @@ void PrintUsage() {
               << "Usage: MCGuard.exe <command> [options]\n\n"
               << "Commands:\n"
               << "  watch              Auto-discover Minecraft (javaw.exe) and attach WFP + ETW + Module Audit\n"
-              << "  run -- <exe> [args] Launch target inside Windows Kernel Restricted Sandbox (Low Integrity + Block Child Proc)\n"
+              << "  run -- <exe> [args] Launch target inside Windows AppContainer Sandbox (Kernel Default-Deny + 3-Tier HKCU Isolation)\n"
               << "  sandbox [args]     Alias for 'run'\n"
               << "  monitor            Real-time interactive security console window\n"
               << "  test-wfp           Test WFP ALE dynamic engine and rule installation\n"
@@ -759,19 +759,6 @@ int main(int argc, char* argv[]) {
 
         view.PrintSuccess("Sandbox Architecture: Windows AppContainer Isolation (" + cfg.appContainer.profileName + ")");
         LogLauncherDiag("Sandbox Architecture: Windows AppContainer Profile=" + cfg.appContainer.profileName);
-
-        for (const auto& p : cfg.protectedPaths) {
-            if (p.empty()) continue;
-            std::wstring wPath = util::Utf8ToWide(p);
-            wchar_t expBuf[MAX_PATH * 4] = { 0 };
-            ExpandEnvironmentStringsW(wPath.c_str(), expBuf, sizeof(expBuf) / sizeof(expBuf[0]));
-            std::string u8Path = util::WideToUtf8(expBuf);
-            cfg.sensitivePatterns.push_back(u8Path);
-            size_t lastSlash = u8Path.find_last_of("\\/");
-            if (lastSlash != std::string::npos && lastSlash + 1 < u8Path.size()) {
-                cfg.sensitivePatterns.push_back(u8Path.substr(lastSlash + 1));
-            }
-        }
 
         // 3. Initialize WFP ALE engine
         core::WfpGuard wfp;

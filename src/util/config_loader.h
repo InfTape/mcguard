@@ -10,11 +10,7 @@ namespace util {
 struct SandboxConfig {
     bool enabled = true;
     bool blockChildProcesses = true;
-    bool lowIntegrity = true;
-    bool stripPrivileges = true;
     bool useJobObject = true;
-    bool restoreOnExit = true;
-    bool denyUserSid = true;
     std::string realJavaPath;
 };
 
@@ -31,11 +27,6 @@ struct ConfigData {
     std::vector<std::string> sensitivePatterns;
     std::vector<std::string> allowedDomainSuffixes;
     std::vector<std::string> allowedFolders;
-    std::vector<std::string> protectedPaths = {
-        "%APPDATA%\\.hmcl\\private\\user-account-private-data.json",
-        "%USERPROFILE%\\.ssh",
-        "%USERPROFILE%\\Desktop"
-    };
     bool allowLocalhost = true;
     bool allowLan = true;
     bool allowDns = true;

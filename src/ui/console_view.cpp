@@ -85,7 +85,7 @@ void ConsoleView::Initialize(bool wfpActive, const std::string& wfpDetail) {
     std::cout << (m_ansiSupported ? ANSI_CYAN ANSI_BOLD : "")
               << "========================================================================================\n"
               << "             MCGuard - Standalone Pure User-Mode Minecraft Sandbox Auditor              \n"
-              << "     " << wfpBadge << " [Process Integrity: LOW] [Native Audit: Active]    \n"
+              << "     " << wfpBadge << " [AppContainer: ACTIVE] [Native Audit: Active]    \n"
               << "========================================================================================\n"
               << (m_ansiSupported ? ANSI_RESET : "");
 

@@ -75,17 +75,8 @@
   "sandbox": {
     "enabled": true,
     "block_child_processes": true,
-    "low_integrity": true,
-    "strip_privileges": true,
     "use_job_object": true,
-    "deny_user_sid": true,
-    "restore_on_exit": true,
-    "real_java_path": "",
-    "protected_paths": [
-      "%APPDATA%\\.hmcl\\private\\user-account-private-data.json",
-      "%USERPROFILE%\\.ssh",
-      "%USERPROFILE%\\Desktop"
-    ]
+    "real_java_path": ""
   },
   "appcontainer": {
     "enabled": true,

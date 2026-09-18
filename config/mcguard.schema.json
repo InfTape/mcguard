@@ -114,17 +114,10 @@
     "sandbox": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
-        "block_child_processes": { "type": "boolean" },
-        "low_integrity": { "type": "boolean" },
-        "strip_privileges": { "type": "boolean" },
-        "use_job_object": { "type": "boolean" },
-        "real_java_path": { "type": "string" },
-        "protected_paths": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "List of private files or directories to protect with Windows Mandatory Integrity Control (MIC) No-Read-Up & No-Write-Up (NRNW). Low-Integrity sandboxed Minecraft/Mods are strictly denied read and write access."
-        }
+        "enabled": { "type": "boolean", "description": "Enable sandbox launcher execution" },
+        "block_child_processes": { "type": "boolean", "description": "Prevent child process breakout (cmd.exe, powershell)" },
+        "use_job_object": { "type": "boolean", "description": "Enforce ActiveProcessLimit = 1 via Windows Job Object" },
+        "real_java_path": { "type": "string", "description": "Path to target java.exe/javaw.exe executable (optional)" }
       }
     },
     "appcontainer": {

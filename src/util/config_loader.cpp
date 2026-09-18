@@ -297,29 +297,6 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
         }
     }
 
-    // Parse protected_paths / protected_files
-    size_t ppPos = configContent.find("\"protected_paths\"");
-    if (ppPos == std::string::npos) {
-        ppPos = configContent.find("\"protected_files\"");
-    }
-    if (ppPos != std::string::npos) {
-        size_t arrStart = configContent.find('[', ppPos);
-        size_t arrEnd = configContent.find(']', arrStart);
-        if (arrStart != std::string::npos && arrEnd != std::string::npos) {
-            std::string arrStr = configContent.substr(arrStart, arrEnd - arrStart + 1);
-            size_t strPos = 0;
-            while ((strPos = arrStr.find('\"', strPos)) != std::string::npos) {
-                size_t end = arrStr.find('\"', strPos + 1);
-                if (end == std::string::npos) break;
-                std::string path = arrStr.substr(strPos + 1, end - strPos - 1);
-                if (!path.empty()) {
-                    outConfig.protectedPaths.push_back(path);
-                }
-                strPos = end + 1;
-            }
-        }
-    }
-
     // Parse sandbox settings
     size_t sbPos = configContent.find("\"sandbox\"");
     if (sbPos != std::string::npos) {
@@ -333,20 +310,8 @@ bool ConfigLoader::LoadConfig(const std::string& customPath, ConfigData& outConf
             std::string bcp = FindJsonFieldValue(sbStr, "block_child_processes");
             if (!bcp.empty()) outConfig.sandbox.blockChildProcesses = (bcp == "true");
 
-            std::string li = FindJsonFieldValue(sbStr, "low_integrity");
-            if (!li.empty()) outConfig.sandbox.lowIntegrity = (li == "true");
-
-            std::string sp = FindJsonFieldValue(sbStr, "strip_privileges");
-            if (!sp.empty()) outConfig.sandbox.stripPrivileges = (sp == "true");
-
             std::string ujo = FindJsonFieldValue(sbStr, "use_job_object");
             if (!ujo.empty()) outConfig.sandbox.useJobObject = (ujo == "true");
-
-            std::string roe = FindJsonFieldValue(sbStr, "restore_on_exit");
-            if (!roe.empty()) outConfig.sandbox.restoreOnExit = (roe == "true");
-
-            std::string dus = FindJsonFieldValue(sbStr, "deny_user_sid");
-            if (!dus.empty()) outConfig.sandbox.denyUserSid = (dus == "true");
 
             std::string rjp = FindJsonFieldValue(sbStr, "real_java_path");
             if (!rjp.empty()) outConfig.sandbox.realJavaPath = rjp;
