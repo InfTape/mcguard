@@ -17,6 +17,75 @@
 namespace mcguard {
 namespace core {
 
+std::wstring SandboxLauncher::FindAvailableVirtualDrive() {
+    DWORD drives = GetLogicalDrives();
+    for (wchar_t letter = L'Z'; letter >= L'E'; --letter) {
+        int bit = letter - L'A';
+        if ((drives & (1 << bit)) == 0) {
+            return std::wstring(1, letter) + L":";
+        }
+    }
+    return L"";
+}
+
+bool SandboxLauncher::MapVirtualDrive(const std::wstring& targetPath, std::wstring& outDriveLetter) {
+    if (targetPath.empty()) return false;
+    outDriveLetter = FindAvailableVirtualDrive();
+    if (outDriveLetter.empty()) return false;
+
+    std::wstring ntTarget = L"\\??\\" + targetPath;
+    while (!ntTarget.empty() && ntTarget.back() == L'\\') {
+        ntTarget.pop_back();
+    }
+
+    BOOL ok = DefineDosDeviceW(DDD_RAW_TARGET_PATH, outDriveLetter.c_str(), ntTarget.c_str());
+    return (ok != FALSE);
+}
+
+void SandboxLauncher::UnmapVirtualDrive(const std::wstring& driveLetter, const std::wstring& targetPath) {
+    if (driveLetter.empty()) return;
+    std::wstring ntTarget = L"\\??\\" + targetPath;
+    while (!ntTarget.empty() && ntTarget.back() == L'\\') {
+        ntTarget.pop_back();
+    }
+    DefineDosDeviceW(
+        DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
+        driveLetter.c_str(),
+        ntTarget.c_str()
+    );
+}
+
+std::wstring SandboxLauncher::ReplacePathPrefixCaseInsensitive(
+    const std::wstring& text,
+    const std::wstring& oldPrefix,
+    const std::wstring& newPrefix
+) {
+    if (oldPrefix.empty() || text.empty()) return text;
+
+    std::wstring normOld = oldPrefix;
+    for (auto& ch : normOld) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+    while (!normOld.empty() && normOld.back() == L'\\') normOld.pop_back();
+
+    std::wstring normText = text;
+    for (auto& ch : normText) { if (ch == L'/') ch = L'\\'; ch = towlower(ch); }
+
+    std::wstring result;
+    size_t lastPos = 0;
+    size_t pos = 0;
+
+    while ((pos = normText.find(normOld, lastPos)) != std::wstring::npos) {
+        result.append(text, lastPos, pos - lastPos);
+        result.append(newPrefix);
+        size_t afterOld = pos + normOld.length();
+        if (afterOld >= text.length() || (text[afterOld] != L'\\' && text[afterOld] != L'/')) {
+            result.push_back(L'\\');
+        }
+        lastPos = afterOld;
+    }
+    result.append(text, lastPos, text.length() - lastPos);
+    return result;
+}
+
 std::wstring SandboxLauncher::GetJavaHomeFromPath(const std::wstring& exePath) {
     if (exePath.empty()) return L"";
     std::wstring path = exePath;
@@ -359,12 +428,7 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     }
 
     // 3. Grant File Access to Game Directory & Java Runtime for AppContainer SID
-    if (!options.gameDir.empty()) {
-        GrantAncestorsTraverseAccess(options.gameDir, pAppContainerSid);
-        GrantAppContainerFileAccess(options.gameDir, pAppContainerSid, GENERIC_ALL, true);
-    }
-
-    // Auto-detect .minecraft root and grant full access
+    // Auto-detect .minecraft root
     std::wstring mcRoot;
     if (!options.gameDir.empty()) {
         std::wstring lowerGameDir = options.gameDir;
@@ -385,9 +449,50 @@ bool SandboxLauncher::LaunchSandboxedProcess(
             mcRoot = commandLine.substr(start, (cmdMcPos + 10) - start);
         }
     }
+    if (mcRoot.empty()) {
+        mcRoot = options.gameDir;
+    }
 
-    if (!mcRoot.empty() && mcRoot != options.gameDir) {
+    if (!options.gameDir.empty()) {
+        GrantAncestorsTraverseAccess(options.gameDir, pAppContainerSid);
+        GrantAppContainerFileAccess(options.gameDir, pAppContainerSid, GENERIC_ALL, true);
+    }
+
+    if (!mcRoot.empty()) {
+        GrantAncestorsTraverseAccess(mcRoot, pAppContainerSid);
         GrantAppContainerFileAccess(mcRoot, pAppContainerSid, GENERIC_ALL, true);
+
+        // Explicitly ensure critical subdirectories have inherited full access
+        static const std::vector<std::wstring> s_mcSubDirs = {
+            L"libraries", L"assets", L"versions", L"mods", L"config",
+            L".fabric", L"logs", L"saves", L".mixin.out"
+        };
+        for (const auto& sub : s_mcSubDirs) {
+            std::wstring subPath = mcRoot;
+            if (subPath.back() != L'\\') subPath += L'\\';
+            subPath += sub;
+            if (GetFileAttributesW(subPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                GrantAppContainerFileAccess(subPath, pAppContainerSid, GENERIC_ALL, true);
+            }
+        }
+    }
+
+    // Map Virtual Drive for mcRoot to bypass Windows parent traverse limitations for AppContainers
+    std::wstring effectiveCmdLine = commandLine;
+    std::wstring effectiveWorkingDir;
+    if (!mcRoot.empty()) {
+        std::wstring mappedDrive;
+        if (MapVirtualDrive(mcRoot, mappedDrive)) {
+            outInfo.virtualDriveLetter = mappedDrive;
+            outInfo.virtualDriveTargetPath = mcRoot;
+
+            effectiveCmdLine = ReplacePathPrefixCaseInsensitive(effectiveCmdLine, mcRoot, mappedDrive);
+            if (!options.gameDir.empty()) {
+                effectiveWorkingDir = ReplacePathPrefixCaseInsensitive(options.gameDir, mcRoot, mappedDrive);
+            } else {
+                effectiveWorkingDir = mappedDrive + L"\\";
+            }
+        }
     }
 
     // Grant Java runtime access
@@ -549,7 +654,7 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         creationFlags |= CREATE_SUSPENDED;
     }
 
-    std::vector<wchar_t> cmdLineBuf(commandLine.begin(), commandLine.end());
+    std::vector<wchar_t> cmdLineBuf(effectiveCmdLine.begin(), effectiveCmdLine.end());
     cmdLineBuf.push_back(L'\0');
 
     PROCESS_INFORMATION pi = { 0 };
@@ -562,7 +667,7 @@ bool SandboxLauncher::LaunchSandboxedProcess(
         pipesCreated ? TRUE : FALSE,
         creationFlags,
         envBlock.empty() ? NULL : envBlock.data(),
-        NULL,
+        effectiveWorkingDir.empty() ? NULL : effectiveWorkingDir.c_str(),
         &siex.StartupInfo,
         &pi
     );
@@ -577,6 +682,11 @@ bool SandboxLauncher::LaunchSandboxedProcess(
     if (!success) {
         DWORD err = GetLastError();
         outError = "CreateProcessW failed: " + std::to_string(err);
+        if (!outInfo.virtualDriveLetter.empty()) {
+            UnmapVirtualDrive(outInfo.virtualDriveLetter, outInfo.virtualDriveTargetPath);
+            outInfo.virtualDriveLetter.clear();
+            outInfo.virtualDriveTargetPath.clear();
+        }
         if (hChildStdOutRead) CloseHandle(hChildStdOutRead);
         if (hChildStdErrRead) CloseHandle(hChildStdErrRead);
         return false;
@@ -613,6 +723,13 @@ bool SandboxLauncher::ResumeSandboxedProcess(SandboxProcessInfo& procInfo) {
 }
 
 void SandboxLauncher::CleanupProcessInfo(SandboxProcessInfo& procInfo) {
+    // Unmap virtual drive if mapped
+    if (!procInfo.virtualDriveLetter.empty()) {
+        UnmapVirtualDrive(procInfo.virtualDriveLetter, procInfo.virtualDriveTargetPath);
+        procInfo.virtualDriveLetter.clear();
+        procInfo.virtualDriveTargetPath.clear();
+    }
+
     // Revoke granted registry subkeys cleanly upon termination (Tier B cleanup)
     if (procInfo.pAppContainerSid) {
         for (const auto& subKey : procInfo.grantedRegistryKeys) {

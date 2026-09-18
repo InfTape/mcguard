@@ -30,12 +30,14 @@ static core::WfpGuard* g_pWfp = nullptr;
 static core::EtwWatcher* g_pEtw = nullptr;
 static core::NetworkTracker* g_pNetTracker = nullptr;
 static core::FolderWatcher* g_pFolderWatcher = nullptr;
+static core::SandboxProcessInfo* g_pProcInfo = nullptr;
 
 // Global protected paths tracking for Clean Exit restoration
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
         std::cout << "\n[*] Shutting down MCGuard cleanly...\n";
         g_exitRequested = true;
+        if (g_pProcInfo) core::SandboxLauncher::CleanupProcessInfo(*g_pProcInfo);
         if (g_pWfp) g_pWfp->Shutdown();
         if (g_pEtw) g_pEtw->Stop();
         if (g_pNetTracker) g_pNetTracker->StopPolling();
@@ -859,11 +861,13 @@ int main(int argc, char* argv[]) {
         std::string launchErr;
         LogLauncherDiag("Launching Sandboxed Process: " + targetExe);
         LogLauncherDiag("Target Command Line (truncated): " + (targetCmdLine.size() > 300 ? targetCmdLine.substr(0, 300) + "..." : targetCmdLine));
+        g_pProcInfo = &procInfo;
         bool launched = core::SandboxLauncher::LaunchSandboxedProcess(
             wTargetExe, wCmdLine, sbOptions, procInfo, launchErr
         );
 
         if (!launched) {
+            g_pProcInfo = nullptr;
             LogLauncherDiag("Sandbox launch FAILED: " + launchErr);
             view.PrintError("Sandbox launch failed: " + launchErr);
             return 1;
@@ -871,6 +875,10 @@ int main(int argc, char* argv[]) {
 
         LogLauncherDiag("Sandbox launch SUCCESS. Sandboxed PID=" + std::to_string(procInfo.processId));
         view.PrintSuccess("Process created inside AppContainer Sandbox (PID: " + std::to_string(procInfo.processId) + ")");
+        if (!procInfo.virtualDriveLetter.empty()) {
+            view.PrintSuccess("AppContainer Virtual Drive: " + util::WideToUtf8(procInfo.virtualDriveLetter) + " -> " + util::WideToUtf8(procInfo.virtualDriveTargetPath));
+            LogLauncherDiag("AppContainer Virtual Drive: " + util::WideToUtf8(procInfo.virtualDriveLetter) + " -> " + util::WideToUtf8(procInfo.virtualDriveTargetPath));
+        }
         if (!procInfo.appContainerSidStr.empty()) {
             view.PrintStatus("AppContainer SID: " + util::WideToUtf8(procInfo.appContainerSidStr));
         }
@@ -1216,6 +1224,7 @@ int main(int argc, char* argv[]) {
         }
 
         core::SandboxLauncher::CleanupProcessInfo(procInfo);
+        g_pProcInfo = nullptr;
 
         view.PrintSuccess("MCGuard Sandbox session ended cleanly.");
         return (int)sandboxedExitCode;

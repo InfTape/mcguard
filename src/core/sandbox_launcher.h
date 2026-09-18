@@ -36,10 +36,22 @@ struct SandboxProcessInfo {
     std::wstring appContainerSidStr;
     std::wstring appContainerFolder;
     std::vector<std::wstring> grantedRegistryKeys;
+
+    std::wstring virtualDriveLetter;       // e.g. L"Z:"
+    std::wstring virtualDriveTargetPath;   // e.g. L"C:\Users\Admin\Desktop\HMCL\.minecraft"
 };
 
 class SandboxLauncher {
 public:
+    // Virtual Drive Helpers to bypass Windows parent directory traverse checks for AppContainer
+    static std::wstring FindAvailableVirtualDrive();
+    static bool MapVirtualDrive(const std::wstring& targetPath, std::wstring& outDriveLetter);
+    static void UnmapVirtualDrive(const std::wstring& driveLetter, const std::wstring& targetPath);
+    static std::wstring ReplacePathPrefixCaseInsensitive(
+        const std::wstring& text,
+        const std::wstring& oldPrefix,
+        const std::wstring& newPrefix
+    );
     // Launch a target application inside Windows AppContainer Sandbox
     static bool LaunchSandboxedProcess(
         const std::wstring& applicationPath,
